@@ -1,26 +1,59 @@
 /**
- * Pure translation between Grok Build's on-disk transcript format and squab's
- * canonical message array. No filesystem access lives in this module.
+ * Pure translation between the Antigravity CLI's on-disk transcript format and
+ * squab's canonical message array. No filesystem access lives in this module.
  *
- * Grok writes three files per session:
- *   chat_history.jsonl  the conversation (no timestamps on any line)
- *   summary.json        session metadata (created_at, model, cwd, ...)
- *   updates.jsonl       the ACP event stream, which is where timestamps and
- *                       token usage actually live
+ * agy writes one JSON object per line into
+ * `brain/<id>/.system_generated/logs/transcript_full.jsonl`. Every line is a
+ * "step":
+ *
+ *   {
+ *     "step_index": 9,
+ *     "source": "USER_EXPLICIT" | "MODEL" | "SYSTEM",
+ *     "type": "USER_INPUT" | "PLANNER_RESPONSE" | "VIEW_FILE" | ...,
+ *     "status": "DONE",
+ *     "created_at": "2026-09-09T20:56:58Z",
+ *     "content": "...",            // absent on some steps
+ *     "thinking": "...",           // PLANNER_RESPONSE only, optional
+ *     "error": "...",              // failed steps, optional
+ *     "tool_calls": [{ "name": "view_file", "args": { ... } }]
+ *   }
+ *
+ * The step stream is flat: a model turn is one PLANNER_RESPONSE carrying the
+ * assistant text and its tool calls, and each tool's *result* arrives as its
+ * own following step whose `type` names the tool (VIEW_FILE, RUN_COMMAND,
+ * GREP_SEARCH, ...). The steps carry no ids linking a call to its result, so
+ * this module synthesises ids and pairs them first-in-first-out.
+ *
+ * Transcript lines carry no token accounting of any kind, so squab's usage
+ * fields stay zero -- see adapter.parseSessionFile.
  */
 
 const EPOCH_ZERO = "1970-01-01T00:00:00.000Z";
 const MAX_TEXT_BYTES = 256 * 1024;
 const TRUNCATION_SUFFIX = "\n\n[truncated]";
-const HANDOFF_SYNTHETIC_REASON = "xirp_handoff";
-const KNOWN_HISTORY_TYPES = new Set([
-  "system",
-  "user",
-  "reasoning",
-  "assistant",
-  "tool_result",
-  "backend_tool_call",
-]);
+
+/** Steps the user typed. */
+const USER_STEP_TYPES = new Set(["USER_INPUT"]);
+/** Steps that are a model turn (text + thinking + tool calls). */
+const ASSISTANT_STEP_TYPES = new Set(["PLANNER_RESPONSE"]);
+/**
+ * SYSTEM steps worth surfacing to the reader. ERROR_MESSAGE reports a failed
+ * turn; CHECKPOINT is the compaction summary agy resumes from; SYSTEM_MESSAGE
+ * carries inter-agent messages.
+ */
+const SYSTEM_NOTE_STEP_TYPES = new Set(["ERROR_MESSAGE", "CHECKPOINT", "SYSTEM_MESSAGE"]);
+/**
+ * Steps deliberately dropped: CONVERSATION_HISTORY has no content at all, and
+ * EPHEMERAL_MESSAGE is the CLI's own boilerplate reminder text, not
+ * conversation.
+ */
+const IGNORED_STEP_TYPES = new Set(["CONVERSATION_HISTORY", "EPHEMERAL_MESSAGE"]);
+/**
+ * Step type used when re-encoding a tool result into agy's shape. It is a real
+ * MODEL tool-result type agy itself emits, and the reader below maps any
+ * unrecognised MODEL step to a tool result, so the round trip is stable.
+ */
+const GENERIC_STEP_TYPE = "GENERIC";
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -53,6 +86,11 @@ function truncateText(text, maxBytes = MAX_TEXT_BYTES) {
   return text.slice(0, low) + TRUNCATION_SUFFIX;
 }
 
+/**
+ * squab's usage shape. agy's transcript reports no token counts, so every
+ * field stays zero; the constructor is kept so the adapter's ParsedSession
+ * matches what squab's other adapters return.
+ */
 function emptyUsage() {
   return {
     inputTokens: 0,
@@ -66,29 +104,13 @@ function emptyUsage() {
 
 function addUsage(acc, delta) {
   if (!delta) return acc;
-  acc.inputTokens += delta.inputTokens;
-  acc.outputTokens += delta.outputTokens;
-  acc.cacheReadTokens += delta.cacheReadTokens;
-  acc.cacheWriteTokens += delta.cacheWriteTokens;
-  acc.cacheWrite5mTokens += delta.cacheWrite5mTokens;
-  acc.cacheWrite1hTokens += delta.cacheWrite1hTokens;
+  acc.inputTokens += asFiniteNumber(delta.inputTokens);
+  acc.outputTokens += asFiniteNumber(delta.outputTokens);
+  acc.cacheReadTokens += asFiniteNumber(delta.cacheReadTokens);
+  acc.cacheWriteTokens += asFiniteNumber(delta.cacheWriteTokens);
+  acc.cacheWrite5mTokens += asFiniteNumber(delta.cacheWrite5mTokens);
+  acc.cacheWrite1hTokens += asFiniteNumber(delta.cacheWrite1hTokens);
   return acc;
-}
-
-/**
- * Map a Grok turn_completed usage block onto squab's usage shape.
- * Grok reports no cache-TTL split, so the 5m/1h buckets stay at zero.
- */
-function mapTurnUsage(raw) {
-  if (!isPlainObject(raw)) return null;
-  const usage = emptyUsage();
-  usage.inputTokens = asFiniteNumber(raw.inputTokens);
-  usage.outputTokens = asFiniteNumber(raw.outputTokens);
-  usage.cacheReadTokens = asFiniteNumber(raw.cachedReadTokens);
-  usage.cacheWriteTokens = asFiniteNumber(raw.cacheCreationTokens);
-  const total =
-    usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
-  return total === 0 ? null : usage;
 }
 
 /** Split JSONL text into parsed objects, reporting unparseable lines. */
@@ -118,23 +140,19 @@ function parseJsonl(text) {
 }
 
 /**
- * Debug helper: what a chat_history.jsonl contains, including every line type
- * this adapter does not understand. Deliberately not part of ParsedSession.
+ * Debug helper: what a transcript_full.jsonl contains, counted by step type.
+ * Deliberately not part of ParsedSession.
  */
-function inspectHistory(text) {
+function inspectTranscript(text) {
   const { rows, warnings } = parseJsonl(text);
   const counts = {};
-  const entries = [];
+  const steps = [];
   for (const row of rows) {
-    const type = asString(row.value.type);
-    counts[type || "<missing>"] = (counts[type || "<missing>"] ?? 0) + 1;
-    if (!KNOWN_HISTORY_TYPES.has(type)) {
-      warnings.push({ line: row.line, reason: "unknown-type", type });
-      continue;
-    }
-    entries.push(row.value);
+    const type = asString(row.value.type) || "<missing>";
+    counts[type] = (counts[type] ?? 0) + 1;
+    steps.push(row.value);
   }
-  return { entries, warnings, counts };
+  return { steps, warnings, counts };
 }
 
 function toIso(ms) {
@@ -148,282 +166,264 @@ function parseIsoMs(value) {
   return Number.isNaN(ms) ? null : ms;
 }
 
-/** Epoch-ms timestamp of one updates.jsonl line. */
-function updateLineMs(record) {
-  const meta = isPlainObject(record.params) ? record.params._meta : null;
-  if (isPlainObject(meta) && typeof meta.agentTimestampMs === "number") {
-    return Math.trunc(meta.agentTimestampMs);
-  }
-  if (typeof record.timestamp === "number" && Number.isFinite(record.timestamp)) {
-    return Math.trunc(record.timestamp * 1000);
-  }
-  return null;
-}
-
 /**
- * Reduce updates.jsonl to what the transcript needs: per-prompt user
- * timestamps, an ordered queue of agent-unit timestamps (one per assistant
- * message and one per tool call), and the turn_completed usage blocks.
+ * agy stores the typed prompt inside a `<USER_REQUEST>` block, followed by
+ * `<ADDITIONAL_METADATA>` and sometimes `<USER_SETTINGS_CHANGE>` blocks the
+ * user never wrote. Keep only the request body.
  */
-function buildTimeline(updatesText) {
-  const userTs = new Map();
-  const agentTs = [];
-  const usageTurns = [];
-  let sessionId = null;
-  let lastAgentWasMessageChunk = false;
-  const seenToolCalls = new Set();
-
-  const { rows } = parseJsonl(updatesText);
-  for (const { value } of rows) {
-    const params = isPlainObject(value.params) ? value.params : null;
-    if (!params) continue;
-    if (!sessionId && typeof params.sessionId === "string") sessionId = params.sessionId;
-    const update = isPlainObject(params.update) ? params.update : null;
-    if (!update) continue;
-    const kind = asString(update.sessionUpdate);
-    const ms = updateLineMs(value);
-
-    if (kind === "user_message_chunk") {
-      lastAgentWasMessageChunk = false;
-      const meta = isPlainObject(params._meta) ? params._meta : {};
-      const promptIndex =
-        typeof meta.promptIndex === "number" ? Math.trunc(meta.promptIndex) : null;
-      if (promptIndex !== null && ms !== null && !userTs.has(promptIndex)) {
-        userTs.set(promptIndex, ms);
-      }
-      continue;
-    }
-    if (kind === "agent_message_chunk") {
-      // Streaming emits many chunks per assistant message; keep the first.
-      if (!lastAgentWasMessageChunk && ms !== null) agentTs.push(ms);
-      lastAgentWasMessageChunk = true;
-      continue;
-    }
-    if (kind === "tool_call") {
-      lastAgentWasMessageChunk = false;
-      const id = asString(update.toolCallId) || asString(update.id);
-      if (id && seenToolCalls.has(id)) continue;
-      if (id) seenToolCalls.add(id);
-      if (ms !== null) agentTs.push(ms);
-      continue;
-    }
-    if (kind === "turn_completed") {
-      lastAgentWasMessageChunk = false;
-      const usage = mapTurnUsage(update.usage);
-      if (usage) usageTurns.push(usage);
-      continue;
-    }
-  }
-  return { userTs, agentTs, usageTurns, sessionId };
-}
-
-function emptyTimeline() {
-  return { userTs: new Map(), agentTs: [], usageTurns: [], sessionId: null };
-}
-
-// Grok wraps the typed prompt as "<user_query>\n...\n</user_query>" before
-// storing it; strip that so Xirp shows what the user actually typed.
-const USER_QUERY_RE = /^\s*<user_query>\s*([\s\S]*?)\s*<\/user_query>\s*$/;
-function unwrapUserQuery(text) {
-  const m = typeof text === "string" ? text.match(USER_QUERY_RE) : null;
-  return m ? m[1] : text;
-}
-
-function joinTextBlocks(content, separator) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts = [];
-  for (const block of content) {
-    if (!isPlainObject(block)) continue;
-    if (asString(block.type) !== "text") continue;
-    const text = asString(block.text);
-    if (text) parts.push(text);
-  }
-  return parts.join(separator);
-}
-
-function describeBackendToolCall(entry) {
-  const kind = isPlainObject(entry.kind) ? entry.kind : {};
-  const toolType = asString(kind.tool_type) || "tool";
-  const action = isPlainObject(kind.action) ? kind.action : {};
-  const query = asString(action.query);
-  return query ? `Grok ran ${toolType}: ${query}` : `Grok ran ${toolType}`;
+const USER_REQUEST_PATTERN = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/;
+function extractUserRequest(content) {
+  if (typeof content !== "string") return "";
+  const match = content.match(USER_REQUEST_PATTERN);
+  if (match) return match[1];
+  // No wrapper: strip the trailing system-authored blocks and keep the rest.
+  return content.replace(/<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>[\s\S]*?<\/\1>/g, "").trim();
 }
 
 /**
- * How many agent-unit timestamps an assistant history line consumes: one for
- * the assistant message itself (when it has text) plus one per tool call.
+ * Tool name implied by a tool-result step type. agy derives tool names by
+ * lowercasing the step type and dropping the CORTEX_STEP_TYPE_ prefix (this is
+ * the same rule its hook `matcher` documentation states).
  */
-function agentUnitsFor(entry) {
-  const toolCalls = Array.isArray(entry.tool_calls) ? entry.tool_calls.length : 0;
-  return (asString(entry.content) ? 1 : 0) + toolCalls;
+function toolNameFromStepType(type) {
+  return asString(type).replace(/^CORTEX_STEP_TYPE_/, "").toLowerCase() || "unknown";
+}
+
+/** Deterministic id for the nth tool call of a step. */
+function synthesizeToolUseId(stepIndex, callIndex) {
+  return `step-${stepIndex}-call-${callIndex}`;
 }
 
 /**
- * chat_history.jsonl -> squab's canonical message array.
+ * transcript_full.jsonl -> squab's canonical message array.
  *
- * opts.timeline  result of buildTimeline(updates.jsonl), optional
- * opts.baseTime  ISO string used as the fallback clock (summary.created_at)
+ * Produces the same message shapes squab's other adapters emit:
+ *   { type: "user_message",      text, timestamp }
+ *   { type: "assistant_message", text, timestamp }
+ *   { type: "tool_use",          id, tool, input, timestamp }
+ *   { type: "tool_result",       toolUseId, output, timestamp, error? }
+ *   { type: "system_note",       text, timestamp }
+ *
+ * opts.baseTime  ISO fallback clock for steps with no parseable created_at
  */
-function historyToMessages(historyText, opts = {}) {
-  const { entries, warnings } = inspectHistory(historyText);
-  const timeline = opts.timeline ?? emptyTimeline();
+function transcriptToMessages(transcriptText, opts = {}) {
+  const { steps, warnings } = inspectTranscript(transcriptText);
   const baseMs = parseIsoMs(opts.baseTime) ?? 0;
   const messages = [];
-  let agentIndex = 0;
+  /** Tool calls emitted but not yet matched to a result step, oldest first. */
+  const pendingToolCalls = [];
   let previousMs = null;
+  let skipped = 0;
 
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    const type = asString(entry.type);
-    if (type === "system" || type === "reasoning") continue;
-
-    let candidateMs = null;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const type = asString(step.type);
+    const source = asString(step.source);
+    const stepIndex = typeof step.step_index === "number" ? Math.trunc(step.step_index) : i;
+    const content = asString(step.content);
     const produced = [];
 
-    if (type === "user") {
-      if (entry.synthetic_reason !== undefined) continue;
-      const text = unwrapUserQuery(joinTextBlocks(entry.content, "\n"));
-      if (typeof entry.prompt_index === "number") {
-        const fromTimeline = timeline.userTs.get(Math.trunc(entry.prompt_index));
-        if (fromTimeline !== undefined) candidateMs = fromTimeline;
-      }
-      produced.push({ type: "user_message", text });
-    } else if (type === "assistant") {
-      const units = agentUnitsFor(entry);
-      if (agentIndex < timeline.agentTs.length) candidateMs = timeline.agentTs[agentIndex];
-      agentIndex += units;
-      const content = asString(entry.content);
-      if (content) produced.push({ type: "assistant_message", text: content });
-      const toolCalls = Array.isArray(entry.tool_calls) ? entry.tool_calls : [];
-      for (const call of toolCalls) {
-        if (!isPlainObject(call)) continue;
-        const rawArgs = call.arguments;
-        let input;
-        if (isPlainObject(rawArgs)) {
-          input = rawArgs;
-        } else {
-          try {
-            const parsed = JSON.parse(asString(rawArgs, "null"));
-            input = isPlainObject(parsed) ? parsed : { raw: asString(rawArgs) };
-          } catch {
-            input = { raw: asString(rawArgs) };
-          }
-        }
-        produced.push({
-          type: "tool_use",
-          id: asString(call.id),
-          tool: asString(call.name, "unknown"),
-          input,
-        });
-      }
-    } else if (type === "tool_result") {
-      produced.push({
-        type: "tool_result",
-        toolUseId: asString(entry.tool_call_id),
-        output: typeof entry.content === "string" ? entry.content : joinTextBlocks(entry.content, "\n"),
-      });
-    } else if (type === "backend_tool_call") {
-      produced.push({ type: "system_note", text: describeBackendToolCall(entry) });
+    if (IGNORED_STEP_TYPES.has(type)) {
+      skipped++;
+      continue;
     }
 
-    if (produced.length === 0) continue;
-    let ms = candidateMs ?? baseMs + i;
+    if (USER_STEP_TYPES.has(type)) {
+      produced.push({ type: "user_message", text: extractUserRequest(content) });
+    } else if (ASSISTANT_STEP_TYPES.has(type)) {
+      // `thinking` is the model's private reasoning. squab's canonical message
+      // set has no reasoning role, so it is dropped rather than shown as text.
+      if (content) produced.push({ type: "assistant_message", text: content });
+      const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+      for (let c = 0; c < toolCalls.length; c++) {
+        const call = toolCalls[c];
+        if (!isPlainObject(call)) continue;
+        const id = synthesizeToolUseId(stepIndex, c);
+        const tool = asString(call.name, "unknown");
+        const input = isPlainObject(call.args) ? call.args : {};
+        pendingToolCalls.push({ id, tool });
+        produced.push({ type: "tool_use", id, tool, input });
+      }
+      if (produced.length === 0) {
+        // A PLANNER_RESPONSE with neither text nor tool calls (agy writes one
+        // for every interrupted turn) carries nothing to show.
+        skipped++;
+        continue;
+      }
+    } else if (SYSTEM_NOTE_STEP_TYPES.has(type)) {
+      const text = asString(step.error) || content;
+      if (!text) {
+        skipped++;
+        continue;
+      }
+      produced.push({ type: "system_note", text });
+    } else if (source === "MODEL") {
+      // Every other MODEL step is a tool result: VIEW_FILE, RUN_COMMAND,
+      // GREP_SEARCH, LIST_DIRECTORY, SEARCH_WEB, CODE_ACTION, GENERIC, ...
+      const toolName = toolNameFromStepType(type);
+      const matchIndex = pendingToolCalls.findIndex((call) => call.tool === toolName);
+      const matched =
+        matchIndex >= 0 ? pendingToolCalls.splice(matchIndex, 1)[0] : pendingToolCalls.shift();
+      const result = {
+        type: "tool_result",
+        toolUseId: matched ? matched.id : null,
+        output: asString(step.error) || content,
+      };
+      if (step.error !== undefined) result.error = asString(step.error);
+      produced.push(result);
+    } else {
+      skipped++;
+      continue;
+    }
+
+    let ms = parseIsoMs(step.created_at) ?? baseMs + i;
     if (previousMs !== null && ms < previousMs) ms = previousMs;
     previousMs = ms;
     const timestamp = toIso(ms);
     for (const message of produced) messages.push({ ...message, timestamp });
   }
 
-  return { messages, warnings };
+  return { messages, warnings, skipped };
 }
 
 /**
- * Canonical message array -> chat_history.jsonl line objects (the leading
- * "system" line is supplied by the caller). Consecutive assistant_message and
- * tool_use messages collapse into a single assistant line, matching Grok.
+ * Canonical message array -> agy transcript step objects.
+ *
+ * Used only for handoff pseudo-sessions: xirp renders a transcript that came
+ * from some other agent into agy's own step shape so that readNative,
+ * readEmbeddedSessionId and parseSessionFile work on it unchanged. This is a
+ * faithful inverse of transcriptToMessages for every canonical message type.
  */
-function messagesToHistory(messages, opts = {}) {
-  const modelId = opts.modelId ?? "grok-4.6";
-  const reasoningEffort = opts.reasoningEffort ?? "high";
-  const lines = [];
-  let promptIndex = 0;
+function messagesToTranscript(messages) {
+  const steps = [];
+  const list = Array.isArray(messages) ? messages : [];
   let i = 0;
 
-  while (i < messages.length) {
-    const message = messages[i];
-    const type = message?.type;
+  const push = (step, timestamp) => {
+    steps.push({
+      step_index: steps.length,
+      status: "DONE",
+      created_at: asString(timestamp, EPOCH_ZERO),
+      ...step,
+    });
+  };
 
-    if (type === "handoff_marker" || type === "image") {
-      i++;
-      continue;
-    }
+  while (i < list.length) {
+    const message = list[i];
+    const type = message?.type;
+    const timestamp = asString(message?.timestamp, EPOCH_ZERO);
+
     if (type === "user_message") {
-      lines.push({
-        type: "user",
-        content: [{ type: "text", text: asString(message.text) }],
-        prompt_index: promptIndex,
-      });
-      promptIndex++;
+      push(
+        {
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          content: `<USER_REQUEST>\n${asString(message.text)}\n</USER_REQUEST>`,
+        },
+        timestamp,
+      );
       i++;
       continue;
     }
     if (type === "system_note") {
-      // Synthetic user turns carry the current prompt_index without consuming
-      // it; readNative skips them, so the index never has to line up.
-      lines.push({
-        type: "user",
-        content: [
-          { type: "text", text: `<system_note>${asString(message.text)}</system_note>` },
-        ],
-        prompt_index: promptIndex,
-        synthetic_reason: HANDOFF_SYNTHETIC_REASON,
-      });
+      push({ source: "SYSTEM", type: "SYSTEM_MESSAGE", content: asString(message.text) }, timestamp);
       i++;
       continue;
     }
     if (type === "tool_result") {
-      lines.push({
-        type: "tool_result",
-        tool_call_id: asString(message.toolUseId),
+      const step = {
+        source: "MODEL",
+        type: GENERIC_STEP_TYPE,
         content: asString(message.output),
-      });
+      };
+      if (message.error !== undefined) step.error = asString(message.error);
+      push(step, timestamp);
       i++;
       continue;
     }
     if (type === "assistant_message" || type === "tool_use") {
+      // Collapse a run of assistant text and tool calls into one
+      // PLANNER_RESPONSE, which is how agy itself records a model turn.
       const texts = [];
       const toolCalls = [];
-      while (
-        i < messages.length &&
-        (messages[i].type === "assistant_message" || messages[i].type === "tool_use")
-      ) {
-        const current = messages[i];
+      const runStart = i;
+      while (i < list.length && (list[i].type === "assistant_message" || list[i].type === "tool_use")) {
+        const current = list[i];
         if (current.type === "assistant_message") {
           const text = asString(current.text);
           if (text) texts.push(text);
         } else {
           toolCalls.push({
-            id: asString(current.id),
             name: asString(current.tool, "unknown"),
-            arguments: JSON.stringify(current.input ?? {}),
+            args: isPlainObject(current.input) ? current.input : {},
           });
         }
         i++;
       }
-      const line = {
-        type: "assistant",
-        content: texts.join("\n\n"),
-        model_id: modelId,
-        reasoning_effort: reasoningEffort,
-      };
-      if (toolCalls.length > 0) line.tool_calls = toolCalls;
-      lines.push(line);
+      const step = { source: "MODEL", type: "PLANNER_RESPONSE", content: texts.join("\n\n") };
+      if (toolCalls.length > 0) step.tool_calls = toolCalls;
+      push(step, asString(list[runStart]?.timestamp, EPOCH_ZERO));
       continue;
     }
+    // handoff_marker, image and anything else squab may add: nothing agy can
+    // represent, so it is dropped rather than mis-encoded.
     i++;
   }
-  return lines;
+  return steps;
+}
+
+/** Canonical messages -> a Markdown rendering an agent can read and resume from. */
+function messagesToMarkdown(messages, opts = {}) {
+  const list = Array.isArray(messages) ? messages : [];
+  const lines = [];
+  const title = asString(opts.title, "Handed-off conversation");
+  lines.push(`# ${title}`, "");
+  if (opts.cwd) lines.push(`Working directory: \`${opts.cwd}\``, "");
+  lines.push(
+    "This transcript was handed to the Antigravity CLI by xirp. It is a record of a",
+    "conversation that happened elsewhere; read it, then continue the work.",
+    "",
+    "---",
+    "",
+  );
+
+  for (const message of list) {
+    const timestamp = asString(message?.timestamp, EPOCH_ZERO);
+    switch (message?.type) {
+      case "user_message":
+        lines.push(`## User — ${timestamp}`, "", asString(message.text), "");
+        break;
+      case "assistant_message":
+        lines.push(`## Assistant — ${timestamp}`, "", asString(message.text), "");
+        break;
+      case "tool_use":
+        lines.push(
+          `### Tool call: \`${asString(message.tool, "unknown")}\``,
+          "",
+          "```json",
+          JSON.stringify(message.input ?? {}, null, 2),
+          "```",
+          "",
+        );
+        break;
+      case "tool_result":
+        lines.push(
+          "### Tool result",
+          "",
+          "```",
+          truncateText(asString(message.output), 8 * 1024),
+          "```",
+          "",
+        );
+        break;
+      case "system_note":
+        lines.push(`> **System:** ${asString(message.text)}`, "");
+        break;
+      default:
+        break;
+    }
+  }
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n") + "\n";
 }
 
 /**
@@ -436,7 +436,13 @@ function toParsedMessages(messages) {
     const ts = asString(message.timestamp, EPOCH_ZERO);
     switch (message.type) {
       case "user_message":
-        parsed.push({ id: null, ts, role: "user", type: "message", text: truncateText(message.text) });
+        parsed.push({
+          id: null,
+          ts,
+          role: "user",
+          type: "message",
+          text: truncateText(message.text),
+        });
         break;
       case "assistant_message":
         parsed.push({
@@ -501,24 +507,27 @@ function applyParseOpts(rows, opts) {
 export {
   EPOCH_ZERO,
   MAX_TEXT_BYTES,
-  HANDOFF_SYNTHETIC_REASON,
-  KNOWN_HISTORY_TYPES,
+  USER_STEP_TYPES,
+  ASSISTANT_STEP_TYPES,
+  SYSTEM_NOTE_STEP_TYPES,
+  IGNORED_STEP_TYPES,
+  GENERIC_STEP_TYPE,
   isPlainObject,
   asString,
   asFiniteNumber,
   truncateText,
   emptyUsage,
   addUsage,
-  mapTurnUsage,
   parseJsonl,
-  inspectHistory,
+  inspectTranscript,
   toIso,
   parseIsoMs,
-  buildTimeline,
-  emptyTimeline,
-  joinTextBlocks,
-  historyToMessages,
-  messagesToHistory,
+  extractUserRequest,
+  toolNameFromStepType,
+  synthesizeToolUseId,
+  transcriptToMessages,
+  messagesToTranscript,
+  messagesToMarkdown,
   toParsedMessages,
   applyParseOpts,
 };

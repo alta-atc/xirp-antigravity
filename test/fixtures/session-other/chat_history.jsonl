@@ -1,3 +1,0 @@
-{"type":"system","content":"Synthetic system prompt for the other-project fixture."}
-{"type":"user","content":[{"type":"text","text":"List the open tasks."}],"prompt_index":0}
-{"type":"assistant","content":"There are two open tasks.","model_id":"grok-4.6-build","reasoning_effort":"low"}

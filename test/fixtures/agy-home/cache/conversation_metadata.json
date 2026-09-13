@@ -1,0 +1,52 @@
+{
+  "conversations": {
+    "11111111-2222-3333-4444-555555555555": {
+      "summary": {
+        "ID": "11111111-2222-3333-4444-555555555555",
+        "Title": "",
+        "Preview": "Summarise the parser",
+        "NumSteps": 10,
+        "Loaded": true,
+        "UpdatedAt": "2026-09-12T10:00:07Z",
+        "WorkspaceURIs": ["file:///fixture/rich-repo"],
+        "AppDataDir": "antigravity-cli",
+        "ProjectID": "aaaaaaaa-0000-0000-0000-000000000001",
+        "AgentName": ""
+      },
+      "is_internal": false,
+      "last_modified_time": "2026-09-12T04:00:07.000000000-06:00"
+    },
+    "22222222-2222-3333-4444-555555555555": {
+      "summary": {
+        "ID": "22222222-2222-3333-4444-555555555555",
+        "Title": "",
+        "Preview": "Inspect the directory",
+        "NumSteps": 2,
+        "Loaded": true,
+        "UpdatedAt": "2026-09-11T09:00:01Z",
+        "WorkspaceURIs": ["file:///fixture/meta-only-repo"],
+        "AppDataDir": "antigravity-cli",
+        "ProjectID": "aaaaaaaa-0000-0000-0000-000000000002",
+        "AgentName": ""
+      },
+      "is_internal": false,
+      "last_modified_time": "2026-09-11T03:00:01.000000000-06:00"
+    },
+    "33333333-2222-3333-4444-555555555555": {
+      "summary": {
+        "ID": "33333333-2222-3333-4444-555555555555",
+        "Title": "An IDE conversation",
+        "Preview": "Belongs to the IDE",
+        "NumSteps": 1,
+        "Loaded": true,
+        "UpdatedAt": "2026-09-11T11:00:00Z",
+        "WorkspaceURIs": ["file:///fixture/meta-only-repo"],
+        "AppDataDir": "antigravity",
+        "ProjectID": "aaaaaaaa-0000-0000-0000-000000000003",
+        "AgentName": ""
+      },
+      "is_internal": false,
+      "last_modified_time": "2026-09-11T05:00:00.000000000-06:00"
+    }
+  }
+}

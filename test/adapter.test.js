@@ -3,400 +3,418 @@ import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
-import { grokAdapter, grokHarnessDef, registerGrok } from "../src/harness/adapter.js";
-import { useTempGrokHome, tempDir, installFixture } from "./helpers.js";
+import {
+  AGENT,
+  antigravityAdapter,
+  antigravityHarnessDef,
+  registerAntigravity,
+  settingsCatalogItems,
+} from "../src/harness/adapter.js";
+import {
+  handoffDir,
+  handoffTranscriptFile,
+  handoffMarkdownFile,
+  handoffSessionFile,
+  transcriptFileFor,
+  conversationDir,
+} from "../src/harness/paths.js";
+import {
+  PROBE_ID,
+  RICH_ID,
+  META_ONLY_ID,
+  IDE_ID,
+  PROBE_CWD,
+  RICH_CWD,
+  META_ONLY_CWD,
+  useFixtureAgyHome,
+  useEmptyAgyHome,
+  useTempHandoffHome,
+  fixtureTranscript,
+} from "./fixtures/agy-home.js";
 
-const BASIC_ID = "11111111-2222-4333-8444-555555555555";
-const OTHER_ID = "99999999-8888-4777-8666-555555555555";
-
-function stripTimestamps(messages) {
-  return messages.map(({ timestamp, ...rest }) => rest);
+/** Both homes, which every adapter test needs to stay off the real machine. */
+async function useHomes(t) {
+  const home = await useFixtureAgyHome(t);
+  const handoff = await useTempHandoffHome(t);
+  return { home, handoff };
 }
 
-test("sessionRoot / locateLatest / findBySessionId address the right files", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
+test("registerAntigravity registers the harness definition before the adapter", () => {
+  const calls = [];
+  registerAntigravity(
+    (adapter) => calls.push(["adapter", adapter.agent]),
+    (def) => calls.push(["harness", def.agentName]),
+  );
+  assert.deepEqual(calls, [
+    ["harness", "antigravity"],
+    ["adapter", "antigravity"],
+  ]);
+});
 
-  assert.equal(grokAdapter.sessionRoot(installed.cwd), installed.bucketDir);
-  assert.equal(await grokAdapter.locateLatest(installed.cwd), installed.sessionFile);
+test("the harness definition describes the agy CLI", () => {
+  assert.equal(AGENT, "antigravity");
+  assert.equal(antigravityHarnessDef.flag, "--launch-antigravity");
+  assert.equal(antigravityHarnessDef.cmd, "launch-antigravity");
+  assert.equal(antigravityHarnessDef.agentName, "antigravity");
+  assert.equal(antigravityHarnessDef.binary, "agy");
+  assert.equal(antigravityHarnessDef.visibility, "public");
+  assert.match(antigravityHarnessDef.installHint, /antigravity\.google/);
+  assert.match(antigravityHarnessDef.description, /`agy`/);
+  // Google publishes no install script, so there is nothing honest to run.
+  assert.deepEqual(antigravityHarnessDef.lifecycle.install, { kind: "none" });
+  assert.deepEqual(antigravityHarnessDef.lifecycle.update, {
+    kind: "self-update",
+    args: ["update"],
+  });
+  assert.deepEqual(antigravityHarnessDef.lifecycle.uninstall, { kind: "none" });
+});
+
+test("sessionRoot is the shared brain directory, since conversations are global", async (t) => {
+  const { home } = await useHomes(t);
+  assert.equal(antigravityAdapter.sessionRoot(PROBE_CWD), path.join(home, "brain"));
   assert.equal(
-    await grokAdapter.findBySessionId(installed.cwd, BASIC_ID),
-    installed.sessionFile,
+    antigravityAdapter.sessionRoot("/some/other/cwd"),
+    antigravityAdapter.sessionRoot(PROBE_CWD),
   );
-  assert.equal(await grokAdapter.findBySessionId(installed.cwd, "nope"), null);
-  assert.equal(await grokAdapter.locateLatest("/Users/example/empty"), null);
 });
 
-test("readEmbeddedSessionId reads summary.json, falling back to the directory name", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  assert.equal(await grokAdapter.readEmbeddedSessionId(installed.sessionFile), BASIC_ID);
-
-  await fsp.rm(path.join(installed.sessionDir, "summary.json"));
-  assert.equal(await grokAdapter.readEmbeddedSessionId(installed.sessionFile), BASIC_ID);
+test("locateLatest resolves a cwd through cache/last_conversations.json", async (t) => {
+  const { home } = await useHomes(t);
+  assert.equal(await antigravityAdapter.locateLatest(PROBE_CWD), fixtureTranscript(home, PROBE_ID));
+  assert.equal(await antigravityAdapter.locateLatest(RICH_CWD), fixtureTranscript(home, RICH_ID));
 });
 
-test("readNative returns the canonical message array for the fixture", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  const messages = await grokAdapter.readNative(installed.sessionFile);
-  assert.equal(messages.length, 9);
+test("locateLatest ignores a mapped conversation whose transcript is missing", async (t) => {
+  await useHomes(t);
+  // /fixture/gone-repo maps to an id with no transcript on disk.
+  assert.equal(await antigravityAdapter.locateLatest("/fixture/gone-repo"), null);
+});
+
+test("locateLatest falls back to the metadata cache and skips IDE conversations", async (t) => {
+  const { home } = await useHomes(t);
+  // /fixture/meta-only-repo is absent from last_conversations.json; two
+  // conversations claim it, but the newer one is an IDE conversation
+  // (AppDataDir "antigravity"), which the CLI adapter must not return.
+  const ide = fixtureTranscript(home, IDE_ID);
+  const now = new Date();
+  await fsp.utimes(ide, now, now);
+  const older = new Date(Date.now() - 60_000);
+  await fsp.utimes(fixtureTranscript(home, META_ONLY_ID), older, older);
+
+  assert.equal(
+    await antigravityAdapter.locateLatest(META_ONLY_CWD),
+    fixtureTranscript(home, META_ONLY_ID),
+  );
+});
+
+test("locateLatest returns null when nothing on disk matches", async (t) => {
+  await useEmptyAgyHome(t);
+  await useTempHandoffHome(t);
+  assert.equal(await antigravityAdapter.locateLatest("/nowhere"), null);
+});
+
+test("locateLatest finds a seeded handoff when agy has no conversation yet", async (t) => {
+  await useEmptyAgyHome(t);
+  await useTempHandoffHome(t);
+  const seeded = await antigravityAdapter.writeNoticeSeed(
+    null,
+    "/fixture/fresh-repo",
+    "sess-seed",
+    "pick up where we left off",
+  );
+  assert.equal(await antigravityAdapter.locateLatest("/fixture/fresh-repo"), seeded);
+  assert.equal(await antigravityAdapter.locateLatest("/fixture/other-repo"), null);
+});
+
+test("findBySessionId looks conversations up globally, not per cwd", async (t) => {
+  const { home } = await useHomes(t);
+  assert.equal(
+    await antigravityAdapter.findBySessionId("/any/cwd", RICH_ID),
+    fixtureTranscript(home, RICH_ID),
+  );
+  assert.equal(await antigravityAdapter.findBySessionId(PROBE_CWD, "no-such-id"), null);
+  assert.equal(await antigravityAdapter.findBySessionId(PROBE_CWD, ""), null);
+});
+
+test("findBySessionId also resolves a handoff pseudo-session", async (t) => {
+  await useHomes(t);
+  const seeded = await antigravityAdapter.writeNoticeSeed(null, RICH_CWD, "sess-handoff", "hello");
+  assert.equal(await antigravityAdapter.findBySessionId(RICH_CWD, "sess-handoff"), seeded);
+});
+
+test("findImportTranscript with no id returns the latest conversation and its cwd", async (t) => {
+  const { home } = await useHomes(t);
+  const found = await antigravityAdapter.findImportTranscript(RICH_CWD, null);
+  assert.deepEqual(found, {
+    path: fixtureTranscript(home, RICH_ID),
+    root: conversationDir(RICH_ID),
+    nativeSessionId: RICH_ID,
+    nativeCwd: RICH_CWD,
+  });
+  assert.equal(await antigravityAdapter.findImportTranscript("/nowhere", null), null);
+});
+
+test("findImportTranscript matches a unique id prefix and rejects an ambiguous one", async (t) => {
+  const { home } = await useHomes(t);
+  const found = await antigravityAdapter.findImportTranscript(PROBE_CWD, "668e81c1");
+  assert.equal(found.path, fixtureTranscript(home, PROBE_ID));
+  assert.equal(found.nativeSessionId, PROBE_ID);
+  assert.equal(found.nativeCwd, PROBE_CWD);
+
+  // A handoff sharing a prefix with a real conversation makes "1111" ambiguous.
+  await antigravityAdapter.writeNoticeSeed(null, RICH_CWD, "11111111-alternate", "hi");
+  await assert.rejects(
+    () => antigravityAdapter.findImportTranscript(PROBE_CWD, "1111"),
+    /Multiple antigravity conversations match/,
+  );
+  assert.equal(await antigravityAdapter.findImportTranscript(PROBE_CWD, "deadbeef"), null);
+
+  // A prefix that only the handoff matches still resolves, rooted at its dir.
+  const handoffMatch = await antigravityAdapter.findImportTranscript(PROBE_CWD, "11111111-a");
+  assert.equal(handoffMatch.nativeSessionId, "11111111-alternate");
+  assert.equal(handoffMatch.root, handoffDir("11111111-alternate"));
+  assert.equal(handoffMatch.nativeCwd, RICH_CWD);
+});
+
+test("nativeCwd reads the live cwd map, then the metadata cache", async (t) => {
+  const { home } = await useHomes(t);
+  assert.equal(await antigravityAdapter.nativeCwd(fixtureTranscript(home, PROBE_ID)), PROBE_CWD);
+  // META_ONLY_ID is absent from last_conversations.json.
+  assert.equal(
+    await antigravityAdapter.nativeCwd(fixtureTranscript(home, META_ONLY_ID)),
+    META_ONLY_CWD,
+  );
+  assert.equal(await antigravityAdapter.nativeCwd(transcriptFileFor("unknown-id")), null);
+});
+
+test("readEmbeddedSessionId takes the conversation id from the path", async (t) => {
+  const { home } = await useHomes(t);
+  assert.equal(await antigravityAdapter.readEmbeddedSessionId(fixtureTranscript(home, RICH_ID)), RICH_ID);
+});
+
+test("readNative parses a real transcript into canonical messages", async (t) => {
+  const { home } = await useHomes(t);
+  const messages = await antigravityAdapter.readNative(fixtureTranscript(home, RICH_ID));
+  assert.equal(messages.length, 10);
+  assert.equal(messages[0].type, "user_message");
+  assert.equal(messages[0].text, "summarise what parser.js does");
+
+  // A path that does not exist yields no messages rather than throwing.
+  assert.deepEqual(await antigravityAdapter.readNative("/no/such/transcript.jsonl"), []);
+});
+
+test("writeNative creates a handoff pseudo-session, not an entry in brain/", async (t) => {
+  const { home } = await useHomes(t);
+  const messages = await antigravityAdapter.readNative(fixtureTranscript(home, RICH_ID));
+
+  const written = await antigravityAdapter.writeNative(
+    messages,
+    antigravityAdapter.sessionRoot(RICH_CWD),
+    RICH_CWD,
+    "sess-42",
+  );
+
+  assert.equal(written, handoffTranscriptFile("sess-42"));
+  // squab's sessionRoot argument is deliberately ignored.
+  assert.equal(written.startsWith(path.join(home, "brain")), false);
+
+  const session = JSON.parse(await fsp.readFile(handoffSessionFile("sess-42"), "utf-8"));
+  assert.equal(session.id, "sess-42");
+  assert.equal(session.cwd, RICH_CWD);
+  assert.equal(session.source, "xirp-handoff");
+  assert.match(session.createdAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  const markdown = await fsp.readFile(handoffMarkdownFile("sess-42"), "utf-8");
+  assert.match(markdown, /summarise what parser\.js does/);
+  assert.match(markdown, /Working directory: `\/fixture\/rich-repo`/);
+
+  // The pseudo-session reads back exactly like a real one.
+  assert.equal(await antigravityAdapter.readEmbeddedSessionId(written), "sess-42");
+  const reread = await antigravityAdapter.readNative(written);
   assert.deepEqual(
-    messages.map((m) => m.type),
-    [
-      "user_message",
-      "assistant_message",
-      "tool_use",
-      "tool_result",
-      "system_note",
-      "assistant_message",
-      "user_message",
-      "tool_use",
-      "tool_result",
-    ],
+    reread.map((message) => message.type),
+    messages.map((message) => message.type),
   );
-  assert.equal(await grokAdapter.readNative(path.join(home, "missing.jsonl")).then((m) => m.length), 0);
 });
 
-test("writeNative round-trips through readNative", async (t) => {
-  const home = await useTempGrokHome(t);
-  const cwd = "/Users/example/roundtrip";
-  const sessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-  const now = "2026-09-12T08:00:00.000Z";
-  const input = [
-    { type: "user_message", text: "Add a test.", timestamp: now },
-    { type: "assistant_message", text: "On it.", timestamp: now },
-    {
-      type: "tool_use",
-      id: "call-write-1",
-      tool: "write_file",
-      input: { target_file: "t.js", contents: "ok" },
-      timestamp: now,
-    },
-    { type: "tool_result", toolUseId: "call-write-1", output: "wrote 2 bytes", timestamp: now },
-    { type: "user_message", text: "Thanks!", timestamp: now },
-  ];
-
-  const dir = grokAdapter.sessionRoot(cwd);
-  const written = await grokAdapter.writeNative(input, dir, cwd, sessionId);
-  assert.equal(written, path.join(dir, sessionId, "chat_history.jsonl"));
-
-  const readBack = await grokAdapter.readNative(written);
-  assert.deepEqual(stripTimestamps(readBack), stripTimestamps(input));
-
-  const summary = JSON.parse(await fsp.readFile(path.join(dir, sessionId, "summary.json"), "utf-8"));
-  assert.deepEqual(summary.info, { id: sessionId, cwd });
-  assert.equal(summary.chat_format_version, 1);
-  assert.equal(summary.num_messages, 0);
-  assert.equal(summary.num_chat_messages, 4);
-  assert.equal(summary.grok_home, home);
-
-  const dirMode = (await fsp.stat(path.join(dir, sessionId))).mode & 0o777;
-  const fileMode = (await fsp.stat(written)).mode & 0o777;
-  assert.equal(dirMode, 0o700);
-  assert.equal(fileMode, 0o600);
-});
-
-test("writeNative drops images and handoff markers and keeps notes synthetic", async (t) => {
-  const home = await useTempGrokHome(t);
-  const cwd = "/Users/example/drops";
-  const sessionId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
-  const written = await grokAdapter.writeNative(
-    [
-      { type: "handoff_marker", timestamp: "2026-09-12T08:00:00.000Z" },
-      { type: "system_note", text: "carried over from xirp", timestamp: "2026-09-12T08:00:00.000Z" },
-      {
-        type: "image",
-        mimeType: "image/png",
-        data: { kind: "base64", bytes: "AAAA" },
-        timestamp: "2026-09-12T08:00:00.000Z",
-      },
-      { type: "user_message", text: "continue", timestamp: "2026-09-12T08:00:00.000Z" },
-    ],
-    grokAdapter.sessionRoot(cwd),
-    cwd,
-    sessionId,
-  );
-
-  const lines = (await fsp.readFile(written, "utf-8")).trim().split("\n").map((l) => JSON.parse(l));
-  assert.deepEqual(lines.map((l) => l.type), ["system", "user", "user"]);
-  assert.equal(lines[1].synthetic_reason, "xirp_handoff");
-  assert.equal(lines[1].content[0].text, "<system_note>carried over from xirp</system_note>");
-  assert.equal(lines[2].content[0].text, "continue");
-
-  const readBack = await grokAdapter.readNative(written);
-  assert.deepEqual(stripTimestamps(readBack), [{ type: "user_message", text: "continue" }]);
-  assert.ok(home);
-});
-
-test("writeNative reuses the system prompt of the newest existing session", async (t) => {
-  const home = await useTempGrokHome(t);
-  await installFixture(home, "session-basic");
-  const cwd = "/Users/example/seeded";
-  const written = await grokAdapter.writeNative(
-    [{ type: "user_message", text: "hi", timestamp: "2026-09-12T08:00:00.000Z" }],
-    grokAdapter.sessionRoot(cwd),
-    cwd,
-    "cccccccc-dddd-4eee-8fff-000000000000",
-  );
-  const first = JSON.parse((await fsp.readFile(written, "utf-8")).split("\n")[0]);
-  assert.equal(first.type, "system");
-  assert.equal(first.content, "You are Grok Build, a synthetic fixture system prompt.");
-});
-
-test("writeNoticeSeed creates a fresh session holding one user message", async (t) => {
-  const home = await useTempGrokHome(t);
-  const cwd = "/Users/example/notice";
-  const sessionId = "dddddddd-eeee-4fff-8000-111111111111";
-  const written = await grokAdapter.writeNoticeSeed(
-    grokAdapter.sessionRoot(cwd),
-    cwd,
-    sessionId,
-    "Session was handed over by xirp.",
-  );
-  const messages = await grokAdapter.readNative(written);
+test("writeNoticeSeed writes a single-user-message handoff", async (t) => {
+  await useHomes(t);
+  const written = await antigravityAdapter.writeNoticeSeed(null, PROBE_CWD, "sess-seed", "resume this");
+  const messages = await antigravityAdapter.readNative(written);
   assert.equal(messages.length, 1);
   assert.equal(messages[0].type, "user_message");
-  assert.equal(messages[0].text, "Session was handed over by xirp.");
-  assert.ok(home);
+  assert.equal(messages[0].text, "resume this");
+  assert.match(await fsp.readFile(handoffMarkdownFile("sess-seed"), "utf-8"), /resume this/);
 });
 
-test("parseSessionFile totals match the hand-computed fixture numbers", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  const parsed = await grokAdapter.parseSessionFile(installed.sessionFile, {});
+test("forkNative copies a real conversation into a fresh handoff", async (t) => {
+  const { home } = await useHomes(t);
+  const source = fixtureTranscript(home, RICH_ID);
+  const forked = await antigravityAdapter.forkNative(source, "sess-fork", RICH_CWD, null);
+
+  assert.equal(forked, handoffTranscriptFile("sess-fork"));
+  assert.notEqual(forked, source);
+  const original = await antigravityAdapter.readNative(source);
+  const copy = await antigravityAdapter.readNative(forked);
+  assert.deepEqual(
+    copy.map((message) => message.type),
+    original.map((message) => message.type),
+  );
+  const session = JSON.parse(await fsp.readFile(handoffSessionFile("sess-fork"), "utf-8"));
+  assert.equal(session.id, "sess-fork");
+});
+
+test("resumeArgs resumes a real conversation by id", async (t) => {
+  const { home } = await useHomes(t);
+  const transcript = fixtureTranscript(home, RICH_ID);
+  assert.deepEqual(antigravityAdapter.resumeArgs(transcript), ["--conversation", RICH_ID]);
+  assert.equal(
+    antigravityAdapter.formatResumeCommand(transcript, "agy"),
+    `agy --conversation ${RICH_ID}`,
+  );
+  assert.equal(
+    antigravityAdapter.formatResumeCommand(transcript, null),
+    `agy --conversation ${RICH_ID}`,
+  );
+});
+
+test("resumeArgs seeds a launch for a handoff, since agy cannot resume a fabricated id", async (t) => {
+  await useHomes(t);
+  const written = await antigravityAdapter.writeNoticeSeed(null, PROBE_CWD, "sess-9", "carry on");
+  const markdown = handoffMarkdownFile("sess-9");
+
+  const args = antigravityAdapter.resumeArgs(written);
+  assert.equal(args.length, 2);
+  assert.equal(args[0], "-i");
+  assert.equal(
+    args[1],
+    `Continue the conversation whose transcript is in ${markdown}. Read it first, then carry on from where it left off.`,
+  );
+  assert.equal(args.includes("--conversation"), false);
+
+  const command = antigravityAdapter.formatResumeCommand(written, "agy");
+  assert.match(command, /^agy -i "/);
+  assert.ok(command.includes(markdown));
+});
+
+test("freshLaunchArgs is empty: agy cannot be told which conversation id to create", () => {
+  assert.deepEqual(antigravityAdapter.freshLaunchArgs("any-id", ["--mode", "plan"]), []);
+  assert.deepEqual(antigravityAdapter.freshLaunchArgs(), []);
+});
+
+test("terminateKeystrokes sends a cancelling Ctrl-C, then the double Ctrl-C that quits", () => {
+  assert.deepEqual(antigravityAdapter.terminateKeystrokes(), [
+    { bytes: "\x03" },
+    { bytes: "\x03\x03", afterMs: 150 },
+  ]);
+});
+
+test("sanitize passes messages through untouched", () => {
+  const messages = [{ type: "user_message", text: "hi", timestamp: "2026-01-01T00:00:00.000Z" }];
+  assert.equal(antigravityAdapter.sanitize(messages), messages);
+});
+
+test("parseSessionFile returns squab's ParsedSession for a real conversation", async (t) => {
+  const { home } = await useHomes(t);
+  const parsed = await antigravityAdapter.parseSessionFile(fixtureTranscript(home, RICH_ID));
 
   assert.equal(parsed.schema, "squab.session-parsed/v1");
-  assert.equal(parsed.agent, "grok");
-  assert.equal(parsed.sessionId, BASIC_ID);
-  assert.equal(parsed.model, "grok-4.6-build");
-  assert.equal(parsed.summary, "Walked through the build script.");
-  assert.equal(parsed.contextWindowSize, null);
-  assert.equal(parsed.messageCount, 9);
-  assert.equal(parsed.messages.length, 9);
-  assert.deepEqual(parsed.lastUserMessage, { text: "Thanks.", ts: "2026-09-10T12:00:10.000Z" });
-  assert.deepEqual(parsed.metadataWatchPaths, [
-    path.join(installed.sessionDir, "summary.json"),
-    path.join(installed.sessionDir, "updates.jsonl"),
-  ]);
-  // 1200 + 2100 in, 340 + 55 out, 800 + 1500 cached reads, 100 + 0 cache writes.
-  assert.deepEqual(parsed.totalUsage, {
-    inputTokens: 3300,
-    outputTokens: 395,
-    cacheReadTokens: 2300,
-    cacheWriteTokens: 100,
-    cacheWrite5mTokens: 0,
-    cacheWrite1hTokens: 0,
+  assert.equal(parsed.sessionId, RICH_ID);
+  assert.equal(parsed.agent, "antigravity");
+  // The model comes from the global settings.json, not from the transcript.
+  assert.equal(parsed.model, "Gemini 3.5 Flash (High)");
+  assert.equal(parsed.summary, "Summarise the parser");
+  assert.equal(parsed.messageCount, 10);
+  assert.deepEqual(parsed.lastUserMessage, {
+    text: "summarise what parser.js does",
+    ts: "2026-09-12T10:00:00.000Z",
   });
-  assert.deepEqual(parsed.latestUsage, {
-    inputTokens: 2100,
-    outputTokens: 55,
-    cacheReadTokens: 1500,
+  // agy's transcript carries no token accounting at all.
+  assert.deepEqual(parsed.totalUsage, {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
     cacheWriteTokens: 0,
     cacheWrite5mTokens: 0,
     cacheWrite1hTokens: 0,
   });
-});
-
-test("parseSessionFile zeroes usage when updates.jsonl is absent", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  await fsp.rm(path.join(installed.sessionDir, "updates.jsonl"));
-  const parsed = await grokAdapter.parseSessionFile(installed.sessionFile, {});
   assert.equal(parsed.latestUsage, null);
-  assert.equal(parsed.totalUsage.inputTokens, 0);
-  assert.equal(parsed.messageCount, 9);
-});
-
-test("parseSessionFile refuses files above maxBytes", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  await assert.rejects(
-    () => grokAdapter.parseSessionFile(installed.sessionFile, { maxBytes: 10 }),
-    (error) => {
-      assert.ok(error.message.startsWith("session file too large"), error.message);
-      assert.equal(error.name, "ParseFileTooLargeError");
-      return true;
-    },
-  );
-});
-
-test("parseSessionFile honours since and limit options", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  const limited = await grokAdapter.parseSessionFile(installed.sessionFile, { limit: 2 });
-  assert.equal(limited.messages.length, 2);
-  assert.equal(limited.messageCount, 9, "messageCount is the unfiltered total");
-
-  const since = await grokAdapter.parseSessionFile(installed.sessionFile, {
-    since: "2026-09-10T12:00:04.000Z",
-  });
-  assert.deepEqual(since.messages.map((m) => m.text), ["Thanks.", 'list_dir({"path":"."})', "scripts/"]);
-});
-
-test("findImportTranscript searches every bucket for a session id prefix", async (t) => {
-  const home = await useTempGrokHome(t);
-  const basic = await installFixture(home, "session-basic");
-  await installFixture(home, "session-other");
-
-  const found = await grokAdapter.findImportTranscript(basic.cwd, "99999999");
-  assert.equal(found.nativeSessionId, OTHER_ID);
-  assert.equal(found.nativeCwd, "/Users/example/other-proj");
-  assert.equal(path.basename(found.path), "chat_history.jsonl");
-
-  assert.equal(await grokAdapter.findImportTranscript(basic.cwd, "deadbeef"), null);
-});
-
-test("findImportTranscript without an id returns the newest session in the bucket", async (t) => {
-  const home = await useTempGrokHome(t);
-  const basic = await installFixture(home, "session-basic");
-  const found = await grokAdapter.findImportTranscript(basic.cwd, null);
-  assert.equal(found.nativeSessionId, BASIC_ID);
-  assert.equal(found.nativeCwd, "/Users/example/proj");
-  assert.equal(found.path, basic.sessionFile);
-});
-
-test("findImportTranscript rejects an ambiguous session id prefix", async (t) => {
-  const home = await useTempGrokHome(t);
-  await installFixture(home, "session-basic");
-  await installFixture(home, "session-basic", { cwd: "/Users/example/second-checkout" });
-  await assert.rejects(
-    () => grokAdapter.findImportTranscript("/Users/example/proj", "1111"),
-    /Multiple grok sessions match "1111"; use a longer session ID/,
-  );
-});
-
-test("forkNative copies the session dir and rewrites its identifiers", async (t) => {
-  const home = await useTempGrokHome(t);
-  const installed = await installFixture(home, "session-basic");
-  const destCwd = "/Users/example/fork-target";
-  const destDir = grokAdapter.sessionRoot(destCwd);
-  const newId = "f0f0f0f0-1111-4222-8333-444444444444";
-
-  const forked = await grokAdapter.forkNative(installed.sessionFile, newId, destCwd, destDir);
-  assert.equal(forked, path.join(destDir, newId, "chat_history.jsonl"));
-
-  const summary = JSON.parse(
-    await fsp.readFile(path.join(destDir, newId, "summary.json"), "utf-8"),
-  );
-  assert.equal(summary.info.id, newId);
-  assert.equal(summary.info.cwd, destCwd);
-  assert.equal(summary.session_summary, "Walked through the build script.");
-
-  const updates = (await fsp.readFile(path.join(destDir, newId, "updates.jsonl"), "utf-8"))
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line));
-  assert.equal(updates.length, 10);
-  for (const record of updates) {
-    assert.equal(record.params.sessionId, newId);
-    assert.match(record.params._meta.eventId, new RegExp(`^${newId}-\\d+$`));
-  }
-  assert.equal(updates[0].params._meta.eventId, `${newId}-1`);
-  assert.equal(updates.at(-1).params._meta.eventId, `${newId}-10`);
-
-  // The conversation itself is copied verbatim.
-  assert.deepEqual(
-    await grokAdapter.readNative(forked),
-    await grokAdapter.readNative(installed.sessionFile),
-  );
-});
-
-test("resumeArgs and formatResumeCommand use --resume with the session id", async (t) => {
-  const dir = await tempDir(t);
-  const sessionFile = path.join(dir, BASIC_ID, "chat_history.jsonl");
-  assert.deepEqual(grokAdapter.resumeArgs(sessionFile), ["--resume", BASIC_ID]);
-  assert.equal(grokAdapter.formatResumeCommand(sessionFile, "grok"), `grok --resume ${BASIC_ID}`);
-  assert.equal(grokAdapter.formatResumeCommand(sessionFile), `grok --resume ${BASIC_ID}`);
-});
-
-test("freshLaunchArgs pins a session id unless the user already chose one", () => {
-  const id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-  assert.deepEqual(grokAdapter.freshLaunchArgs(id, []), ["--session-id", id]);
-  assert.deepEqual(grokAdapter.freshLaunchArgs(id, ["--model", "grok-4.6"]), [
-    "--session-id",
-    id,
+  assert.equal(parsed.contextWindowSize, null);
+  assert.deepEqual(parsed.metadataWatchPaths, [
+    path.join(home, "cache", "last_conversations.json"),
+    path.join(home, "cache", "conversation_metadata.json"),
+    path.join(home, "settings.json"),
   ]);
-  for (const conflicting of [
-    ["--session-id", "x"],
-    ["--session-id=x"],
-    ["-s", "x"],
-    ["--resume"],
-    ["--resume=x"],
-    ["-r"],
-    ["-c"],
-    ["--continue"],
-    ["--fork-session"],
-  ]) {
-    assert.deepEqual(
-      grokAdapter.freshLaunchArgs(id, conflicting),
-      [],
-      `expected no args for ${conflicting.join(" ")}`,
-    );
-  }
+  assert.equal(parsed.messages.length, 10);
 });
 
-test("sanitize is the identity", () => {
-  const messages = [{ type: "user_message", text: "x", timestamp: "2026-09-12T00:00:00.000Z" }];
-  assert.equal(grokAdapter.sanitize(messages), messages);
+test("parseSessionFile handles a handoff pseudo-session", async (t) => {
+  await useHomes(t);
+  const written = await antigravityAdapter.writeNoticeSeed(null, PROBE_CWD, "sess-p", "hello there");
+  const parsed = await antigravityAdapter.parseSessionFile(written);
+
+  assert.equal(parsed.sessionId, "sess-p");
+  assert.equal(parsed.summary, null, "a handoff has no agy-side summary");
+  assert.deepEqual(parsed.metadataWatchPaths, [handoffSessionFile("sess-p")]);
+  assert.equal(parsed.messageCount, 1);
+  assert.equal(parsed.lastUserMessage.text, "hello there");
 });
 
-test("settingsCatalog lists unique (scope, id) pairs", () => {
-  assert.equal(grokAdapter.settingsCatalog.lastUpdated, "2026-09-12");
-  const items = grokAdapter.settingsCatalog.list();
-  const keys = items.map((item) => `${item.scope}:${item.id}`);
-  assert.equal(new Set(keys).size, keys.length, "(scope, id) pairs must be unique");
+test("parseSessionFile applies squab's parse options", async (t) => {
+  const { home } = await useHomes(t);
+  const transcript = fixtureTranscript(home, RICH_ID);
+
+  const limited = await antigravityAdapter.parseSessionFile(transcript, { limit: 3 });
+  assert.equal(limited.messages.length, 3);
+  assert.equal(limited.messageCount, 10, "messageCount counts the whole file");
+
+  const summaryOnly = await antigravityAdapter.parseSessionFile(transcript, { summaryOnly: true });
+  assert.deepEqual(summaryOnly.messages, []);
+
+  const since = await antigravityAdapter.parseSessionFile(transcript, {
+    since: "2026-09-12T10:00:04.000Z",
+  });
+  assert.ok(since.messages.length > 0);
+  assert.ok(since.messages.every((row) => row.ts > "2026-09-12T10:00:04.000Z"));
+});
+
+test("parseSessionFile raises named errors for a missing or oversized file", async (t) => {
+  const { home } = await useHomes(t);
+  await assert.rejects(
+    () => antigravityAdapter.parseSessionFile(path.join(home, "brain", "nope", "x.jsonl")),
+    (error) => error.name === "SessionFileMissingError",
+  );
+  await assert.rejects(
+    () => antigravityAdapter.parseSessionFile(fixtureTranscript(home, RICH_ID), { maxBytes: 10 }),
+    (error) => error.name === "ParseFileTooLargeError",
+  );
+});
+
+test("settingsCatalog lists only surfaces the CLI's own documentation substantiates", () => {
+  const listed = antigravityAdapter.settingsCatalog.list();
+  assert.match(antigravityAdapter.settingsCatalog.lastUpdated, /^\d{4}-\d{2}-\d{2}$/);
   assert.deepEqual(
-    items.map((item) => item.path),
+    listed.map((item) => item.path),
     [
-      "~/.grok/config.toml",
-      "<cwd>/.grok/config.toml",
+      "~/.gemini/antigravity-cli/settings.json",
+      "~/.gemini/config/hooks.json",
+      "~/.gemini/config/mcp_config.json",
+      "~/.gemini/config/skills",
       "<cwd>/AGENTS.md",
-      "~/.grok/hooks/xirp.json",
-      "<cwd>/.mcp.json",
+      "<cwd>/.agents/hooks.json",
     ],
   );
-  for (const item of items) {
-    assert.ok(["global", "project"].includes(item.scope));
-    assert.ok(["toml", "markdown", "json"].includes(item.format));
-    assert.ok(item.label && item.description);
+  for (const item of listed) {
+    assert.ok(["global", "project"].includes(item.scope), item.path);
+    assert.ok(typeof item.label === "string" && item.label.length > 0);
+    assert.ok(typeof item.description === "string" && item.description.length > 0);
   }
+  // list() hands out copies, so a caller cannot mutate the catalog.
+  listed[0].path = "mutated";
+  assert.equal(antigravityAdapter.settingsCatalog.list()[0].path, settingsCatalogItems[0].path);
 });
 
-test("registerGrok registers the harness first, then the adapter", () => {
-  const calls = [];
-  registerGrok(
-    (adapter) => calls.push({ kind: "adapter", value: adapter }),
-    (def) => calls.push({ kind: "harness", value: def }),
-  );
-  assert.deepEqual(calls.map((c) => c.kind), ["harness", "adapter"]);
-  assert.equal(calls[0].value, grokHarnessDef);
-  assert.equal(calls[1].value, grokAdapter);
-});
-
-test("the harness definition matches squab's expected shape", () => {
-  assert.deepEqual(grokHarnessDef, {
-    flag: "--launch-grok",
-    cmd: "launch-grok",
-    agentName: "grok",
-    binary: "grok",
-    installHint: "Install Grok Build: curl -fsSL https://x.ai/cli/install.sh | bash",
-    description: "Hand the terminal over to xAI's `grok` CLI (Grok Build).",
-    visibility: "public",
-    lifecycle: {
-      install: {
-        kind: "vendor-script",
-        url: "https://x.ai/cli/install.sh",
-        interpreter: ["bash"],
-        binDir: "~/.grok/bin",
-      },
-      update: { kind: "self-update", args: ["update"] },
-      uninstall: { kind: "none" },
-    },
-  });
-});
-
-test("the adapter exposes every required member and the hook trio", () => {
+test("the adapter exposes the full method surface squab expects", () => {
   for (const required of [
     "sessionRoot",
     "locateLatest",
@@ -405,30 +423,29 @@ test("the adapter exposes every required member and the hook trio", () => {
     "readEmbeddedSessionId",
     "readNative",
     "writeNative",
-    "resumeArgs",
     "writeNoticeSeed",
-    "parseSessionFile",
-    "freshLaunchArgs",
+    "resumeArgs",
     "formatResumeCommand",
+    "freshLaunchArgs",
     "terminateKeystrokes",
     "sanitize",
     "forkNative",
+    "parseSessionFile",
+    "hookScript",
+    "hookInstallEntry",
   ]) {
-    assert.equal(typeof grokAdapter[required], "function", `missing ${required}`);
+    assert.equal(typeof antigravityAdapter[required], "function", `missing ${required}`);
   }
-  assert.equal(grokAdapter.agent, "grok");
-  assert.equal(typeof grokAdapter.settingsCatalog.list, "function");
-  assert.ok(grokAdapter.hookCapabilities, "hookCapabilities must be implemented");
-  assert.equal(typeof grokAdapter.hookScript, "function");
-  assert.equal(typeof grokAdapter.hookInstallEntry, "function");
+  assert.equal(typeof antigravityAdapter.settingsCatalog.list, "function");
+  assert.equal(typeof antigravityAdapter.hookCapabilities, "object");
 });
 
-test("freshLaunchArgs falls back to recency discovery for non-UUID ids", () => {
-  assert.deepEqual(grokAdapter.freshLaunchArgs("not-a-uuid", []), []);
-});
-
-test("terminateKeystrokes cancels the turn then sends /exit", () => {
-  const keys = grokAdapter.terminateKeystrokes();
-  assert.equal(keys[0].bytes, "\x03");
-  assert.equal(keys[1].bytes, "/exit\r");
+test("no handoff artefacts leak into agy's own brain directory", async (t) => {
+  const { home } = await useHomes(t);
+  const before = (await fsp.readdir(path.join(home, "brain"))).sort();
+  await antigravityAdapter.writeNative([], antigravityAdapter.sessionRoot(RICH_CWD), RICH_CWD, "sess-x");
+  await antigravityAdapter.forkNative(fixtureTranscript(home, RICH_ID), "sess-y", RICH_CWD, null);
+  const after = (await fsp.readdir(path.join(home, "brain"))).sort();
+  assert.deepEqual(after, before);
+  assert.ok(handoffDir("sess-x").length > 0);
 });
