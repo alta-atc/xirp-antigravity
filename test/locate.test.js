@@ -20,6 +20,18 @@ test("locate finds the app, version, node, cli and registry chunk by signature",
   }
 });
 
+test("locate still finds the chunk when a foreign (xirp-grok) import line is already appended", () => {
+  const fake = createFakeApp({ withForeignGrokPatch: true });
+  try {
+    const loc = locate({ app: fake.appPath, env: {} });
+    assert.equal(loc.chunk.path, fake.chunkPath);
+    assert.match(loc.chunk.content, /--launch-cursor/);
+    assert.match(loc.chunk.content, /from "\.\/grok-harness\.js"/);
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("findRegistryChunk throws a code-2 LocateError when no chunk has the signature", () => {
   const fake = createFakeApp({ withSignature: false });
   try {

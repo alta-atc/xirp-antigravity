@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// CLI for xirp-grok: patches Spotify's Xirp.app to add the Grok Build coding
-// agent, and can re-apply that patch automatically after Xirp updates via a
-// launchd watcher.
+// CLI for xirp-antigravity: patches Spotify's Xirp.app to add Google's
+// Antigravity CLI (agy) as a coding agent, and can re-apply that patch
+// automatically after Xirp updates via a launchd watcher.
 //
 // Commands: status, apply [--if-needed] [--app <path>] [--force], remove,
 // doctor, install-watcher, uninstall-watcher.
@@ -29,19 +29,25 @@ import {
   locate,
   LocateError,
 } from "../src/patcher/locate.js";
-import { apply, remove, isPatched, PatchError } from "../src/patcher/inject.js";
+import {
+  apply,
+  remove,
+  isPatched,
+  isGrokPatched,
+  PatchError,
+} from "../src/patcher/inject.js";
 import { readState, stateFilePath } from "../src/patcher/state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
 
-const WATCHER_LABEL = "com.alta-atc.xirp-grok";
+const WATCHER_LABEL = "com.alta-atc.xirp-antigravity";
 const LAUNCH_AGENTS_DIR = path.join(os.homedir(), "Library", "LaunchAgents");
 const LAUNCH_AGENT_PATH = path.join(
   LAUNCH_AGENTS_DIR,
   `${WATCHER_LABEL}.plist`,
 );
-const LOG_PATH = path.join(os.homedir(), "Library", "Logs", "xirp-grok.log");
+const LOG_PATH = path.join(os.homedir(), "Library", "Logs", "xirp-antigravity.log");
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -86,6 +92,7 @@ function cmdStatus({ app }) {
     patched = isPatched(loc.chunk.content);
     console.log(`Chunk:    ${chunkPath}`);
     console.log(`Patched:  ${patched ? "yes" : "no"}`);
+    console.log(`Grok also patched: ${isGrokPatched(loc.chunk.content) ? "yes" : "no"}`);
   } catch (err) {
     console.log(`Chunk:    not found (${err.message})`);
   }
@@ -98,9 +105,9 @@ function cmdStatus({ app }) {
   }
 
   if (patched && state) {
-    console.log("Status:   OK — Grok harness is installed.");
+    console.log("Status:   OK — Antigravity harness is installed.");
   } else if (!patched) {
-    console.log("Status:   not applied. Run `xirp-grok apply`.");
+    console.log("Status:   not applied. Run `xirp-antigravity apply`.");
   } else {
     console.log("Status:   patched, but no local state marker found.");
   }
@@ -142,10 +149,10 @@ function cmdApply({ app, ifNeeded, force }) {
   }
 
   console.log(
-    `${result.action === "refreshed" ? "Refreshed" : "Applied"} Grok harness for Xirp ${result.version}.`,
+    `${result.action === "refreshed" ? "Refreshed" : "Applied"} Antigravity harness for Xirp ${result.version}.`,
   );
   console.log(`  Chunk:   ${result.chunkPath}`);
-  console.log("Restart Xirp to pick up the Grok harness.");
+  console.log("Restart Xirp to pick up the Antigravity harness.");
 }
 
 function cmdRemove({ app }) {
@@ -158,10 +165,10 @@ function cmdRemove({ app }) {
   }
 
   if (result.action === "noop") {
-    console.log("Nothing to remove — Grok harness is not applied.");
+    console.log("Nothing to remove — Antigravity harness is not applied.");
     return;
   }
-  console.log(`Removed Grok harness patch from ${result.chunkPath}.`);
+  console.log(`Removed Antigravity harness patch from ${result.chunkPath}.`);
 }
 
 function cmdDoctor({ app }) {
@@ -200,22 +207,25 @@ function cmdDoctor({ app }) {
       console.log(
         `Chunk patched:   ${isPatched(chunk.content) ? "yes" : "no"}`,
       );
+      console.log(
+        `Grok also patched: ${isGrokPatched(chunk.content) ? "yes" : "no"}`,
+      );
     } catch (err) {
       console.log(`Registry chunk:  not found (${err.message})`);
     }
   }
 
-  let grokOnPath = null;
+  let agyOnPath = null;
   try {
-    grokOnPath = execFileSync("which", ["grok"], { encoding: "utf8" }).trim();
+    agyOnPath = execFileSync("which", ["agy"], { encoding: "utf8" }).trim();
   } catch {
-    grokOnPath = null;
+    agyOnPath = null;
   }
-  console.log(`grok on PATH:    ${grokOnPath || "not found"}`);
+  console.log(`agy on PATH:     ${agyOnPath || "not found"}`);
 
-  const grokHome = path.join(os.homedir(), ".grok", "bin", "grok");
+  const agyHome = path.join(os.homedir(), ".local", "bin", "agy");
   console.log(
-    `~/.grok/bin/grok: ${existsSync(grokHome) ? grokHome : "not found"}`,
+    `~/.local/bin/agy: ${existsSync(agyHome) ? agyHome : "not found"}`,
   );
 
   const state = readState();
@@ -228,6 +238,7 @@ function cmdDoctor({ app }) {
     console.log(`  harnessSha256:       ${state.harnessSha256}`);
     console.log(`  patchVersion:        ${state.patchVersion}`);
     console.log(`  appliedAt:           ${state.appliedAt}`);
+    console.log(`  origOwnedByUs:       ${state.origOwnedByUs}`);
   }
 
   console.log(
@@ -248,7 +259,7 @@ function cmdInstallWatcher({ app }) {
     fail(`error: plist template not found at ${templatePath}`);
   }
   const template = readFileSync(templatePath, "utf8");
-  const binPath = path.join(REPO_ROOT, "bin", "xirp-grok.js");
+  const binPath = path.join(REPO_ROOT, "bin", "xirp-antigravity.js");
 
   const plist = template
     .split("{{LABEL}}")
@@ -323,7 +334,7 @@ function main() {
       return cmdUninstallWatcher(opts);
     default:
       console.error(
-        "Usage: xirp-grok <status|apply|remove|doctor|install-watcher|uninstall-watcher> [--app <path>] [--if-needed] [--force]",
+        "Usage: xirp-antigravity <status|apply|remove|doctor|install-watcher|uninstall-watcher> [--app <path>] [--if-needed] [--force]",
       );
       process.exit(command ? 1 : 0);
   }

@@ -4,13 +4,22 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync, rmSync } from "nod
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createFakeApp, fakeHome, SIGNATURE } from "./helpers/fake-app.js";
-import { apply, remove, isPatched, buildImportLine, detectRegistryIdentifiers, HARNESS_FILENAME, PatchError } from "../src/patcher/inject.js";
+import { createFakeApp, fakeHome, SIGNATURE, GROK_IMPORT_LINE } from "./helpers/fake-app.js";
+import {
+  apply,
+  remove,
+  isPatched,
+  isGrokPatched,
+  buildImportLine,
+  detectRegistryIdentifiers,
+  HARNESS_FILENAME,
+  PatchError,
+} from "../src/patcher/inject.js";
 import { LocateError } from "../src/patcher/locate.js";
 import { readState } from "../src/patcher/state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STUB_HARNESS = path.join(__dirname, "fixtures", "grok-harness.stub.js");
+const STUB_HARNESS = path.join(__dirname, "fixtures", "antigravity-harness.stub.js");
 
 test("apply appends the import line, backs up the chunk, copies the harness, and writes state", () => {
   const fake = createFakeApp();
@@ -49,6 +58,7 @@ test("apply appends the import line, backs up the chunk, copies the harness, and
     assert.equal(typeof state.harnessSha256, "string");
     assert.equal(typeof state.patchVersion, "string");
     assert.ok(state.appliedAt);
+    assert.equal(state.origOwnedByUs, true, "we created the backup, so we own it");
   } finally {
     rmSync(fake.tmpDir, { recursive: true, force: true });
   }
@@ -71,7 +81,7 @@ test("apply is idempotent: a second apply is a no-op and does not duplicate the 
 
     const afterSecond = readFileSync(fake.chunkPath, "utf8");
     assert.equal(afterSecond, afterFirst);
-    const occurrences = afterSecond.split('from "./grok-harness.js"').length - 1;
+    const occurrences = afterSecond.split('from "./antigravity-harness.js"').length - 1;
     assert.equal(occurrences, 1);
   } finally {
     rmSync(fake.tmpDir, { recursive: true, force: true });
@@ -186,7 +196,7 @@ test("apply re-applies after Xirp updates (chunk replaced with a new, unpatched 
 });
 
 test("apply rolls back on a failed verification, leaving the chunk untouched", () => {
-  const fake = createFakeApp({ includeGrok: false });
+  const fake = createFakeApp({ includeAntigravity: false });
   const home = fakeHome(fake.tmpDir);
   try {
     assert.throws(
@@ -194,7 +204,7 @@ test("apply rolls back on a failed verification, leaving the chunk untouched", (
       (err) => {
         assert.ok(err instanceof PatchError);
         assert.match(err.message, /^Rolled back: /);
-        assert.match(err.message, /grok/);
+        assert.match(err.message, /antigravity/);
         return true;
       },
     );
@@ -225,4 +235,88 @@ test("detectRegistryIdentifiers derives names from the real minified shape", () 
   assert.deepEqual(detectRegistryIdentifiers(chunk), { registerAdapter: "V", registerAgent: "z", cursorVar: "vc" });
   assert.equal(detectRegistryIdentifiers('vc={flag:"--launch-cursor"};function f(){a(vc),b(x),c(y)}'), null);
   assert.equal(detectRegistryIdentifiers('nothing here'), null);
+});
+
+// --- Coexistence with xirp-grok ---------------------------------------
+//
+// Both tools patch the same registry chunk by appending one import line
+// each. Whichever tool applies first creates the `.orig` backup and "owns"
+// it; the other must never overwrite or delete that backup, and must never
+// restore the whole chunk from it (that would also undo the first tool's
+// patch).
+
+test("apply on a chunk already patched by xirp-grok appends after its line, without touching grok's backup", () => {
+  const fake = createFakeApp({ withForeignGrokPatch: true });
+  const home = fakeHome(fake.tmpDir);
+  const backupPath = `${fake.chunkPath}.orig`;
+  try {
+    const result = apply({
+      app: fake.appPath,
+      env: {},
+      home,
+      harnessOverride: STUB_HARNESS,
+    });
+    assert.equal(result.action, "applied");
+
+    const patchedContent = readFileSync(fake.chunkPath, "utf8");
+    assert.ok(isGrokPatched(patchedContent), "grok's line must survive");
+    assert.ok(isPatched(patchedContent), "our line must be appended");
+    // Our line comes after grok's.
+    assert.ok(
+      patchedContent.indexOf(GROK_IMPORT_LINE.trim()) <
+        patchedContent.indexOf('from "./antigravity-harness.js"'),
+    );
+
+    // Grok's pristine backup must be untouched byte-for-byte.
+    assert.equal(readFileSync(backupPath, "utf8"), fake.pristineContent);
+
+    const state = readState(home);
+    assert.equal(state.origOwnedByUs, false, "grok created the backup, not us");
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("remove with a grok line present strips only our line, leaving grok's line and its backup intact", () => {
+  const fake = createFakeApp({ withForeignGrokPatch: true });
+  const home = fakeHome(fake.tmpDir);
+  const backupPath = `${fake.chunkPath}.orig`;
+  try {
+    apply({ app: fake.appPath, env: {}, home, harnessOverride: STUB_HARNESS });
+
+    const result = remove({ app: fake.appPath, env: {}, home });
+    assert.equal(result.action, "removed");
+
+    const afterRemove = readFileSync(fake.chunkPath, "utf8");
+    assert.ok(isGrokPatched(afterRemove), "grok's line must still be present");
+    assert.ok(!isPatched(afterRemove), "our line must be gone");
+    assert.equal(afterRemove, fake.chunkContent, "chunk returns to grok-only state");
+
+    assert.ok(existsSync(backupPath), "grok's backup must not be deleted");
+    assert.equal(readFileSync(backupPath, "utf8"), fake.pristineContent);
+
+    assert.ok(!existsSync(path.join(fake.chunksDir, HARNESS_FILENAME)));
+    assert.equal(readState(home), null);
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("remove when we own the backup and nothing else is patched deletes the backup", () => {
+  const fake = createFakeApp();
+  const home = fakeHome(fake.tmpDir);
+  const backupPath = `${fake.chunkPath}.orig`;
+  try {
+    apply({ app: fake.appPath, env: {}, home, harnessOverride: STUB_HARNESS });
+    assert.equal(readState(home).origOwnedByUs, true);
+
+    const result = remove({ app: fake.appPath, env: {}, home });
+    assert.equal(result.action, "removed");
+
+    assert.equal(readFileSync(fake.chunkPath, "utf8"), fake.chunkContent);
+    assert.ok(!existsSync(backupPath), "we own the backup and nothing else is patched, so it's deleted");
+    assert.equal(readState(home), null);
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
 });

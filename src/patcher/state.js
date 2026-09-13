@@ -1,5 +1,5 @@
-// Reads/writes the xirp-grok state marker at ~/.xirp-grok/state.json, which
-// records what was patched and with what hashes so `apply`/`remove`/`status`
+// Reads/writes the xirp-antigravity state marker at ~/.xirp-antigravity/state.json,
+// which records what was patched and with what hashes so `apply`/`remove`/`status`
 // can detect drift (e.g. Xirp updated since the last apply).
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, chownSync } from "node:fs";
@@ -10,7 +10,7 @@ import os from "node:os";
  * Directory holding the state marker. Injectable for tests via `home`.
  */
 export function stateDir(home = os.homedir()) {
-  return path.join(home, ".xirp-grok");
+  return path.join(home, ".xirp-antigravity");
 }
 
 export function stateFilePath(home = os.homedir()) {
@@ -26,14 +26,14 @@ export function readState(home = os.homedir()) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
   } catch (err) {
-    throw new Error(`Corrupt xirp-grok state file at ${file}: ${err.message}`);
+    throw new Error(`Corrupt xirp-antigravity state file at ${file}: ${err.message}`);
   }
 }
 
 /**
- * Write the state marker, creating ~/.xirp-grok if needed.
+ * Write the state marker, creating ~/.xirp-antigravity if needed.
  * `state` shape: { xirpVersion, chunkPath, chunkSha256Original,
- * chunkSha256Patched, harnessSha256, patchVersion, appliedAt }
+ * chunkSha256Patched, harnessSha256, patchVersion, appliedAt, origOwnedByUs }
  */
 // When run under sudo (needed on macOS because of App Management protection),
 // keep the state marker owned by the invoking user so later unprivileged
