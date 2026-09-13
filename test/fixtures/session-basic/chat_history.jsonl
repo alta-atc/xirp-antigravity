@@ -1,0 +1,12 @@
+{"type":"system","content":"You are Grok Build, a synthetic fixture system prompt."}
+{"type":"user","content":[{"type":"text","text":"Explain the build script."}],"prompt_index":0}
+{"type":"reasoning","id":"rs_fixture_1","summary":[{"type":"summary_text","text":"Look at the file first."}],"encrypted_content":"ZmFrZQ==","status":"completed"}
+{"type":"assistant","content":"Reading it now.","tool_calls":[{"id":"call-aaaa-1","name":"read_file","arguments":"{\"target_file\":\"scripts/build.js\"}"}],"model_id":"grok-4.6-build","model_fingerprint":"fp_fixture","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"call-aaaa-1","content":"console.log('hi')"}
+{"type":"backend_tool_call","kind":{"tool_type":"web_search","action":{"type":"search","query":"grok cli docs"}},"id":"ws_fixture_1","status":"completed"}
+{"type":"assistant","content":"It logs a greeting.","model_id":"grok-4.6-build","reasoning_effort":"high"}
+{"type":"user","content":[{"type":"text","text":"Thanks."}],"prompt_index":1}
+{"type":"assistant","content":"","tool_calls":[{"id":"call-bbbb-1","name":"list_dir","arguments":"{\"path\":\".\"}"}],"model_id":"grok-4.6-build","reasoning_effort":"high"}
+{"type":"tool_result","tool_call_id":"call-bbbb-1","content":"scripts/"}
+{"type":"user","content":[{"type":"text","text":"<system_note>handed off from xirp</system_note>"}],"prompt_index":2,"synthetic_reason":"xirp_handoff"}
+{"type":"future_line_type","content":"something this adapter has never seen"}
