@@ -1,0 +1,7 @@
+{
+  "artifactReviewPolicy": "agent-decides",
+  "model": "Gemini 3.5 Flash (High)",
+  "toolPermission": "always-proceed",
+  "trustedWorkspaces": ["/fixture/rich-repo", "/fixture/probe-repo"],
+  "verbosity": "low"
+}

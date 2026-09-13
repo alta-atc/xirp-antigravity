@@ -1,17 +1,43 @@
 import path from "node:path";
 
-import { grokHome } from "./paths.js";
+import { agyHome } from "./paths.js";
 
 /**
- * Native hook installation for xAI's Grok Build CLI.
+ * Native hook installation for Google's Antigravity CLI (`agy`).
  *
- * Grok's hook system is Claude-Code-compatible (see
- * ~/.grok/docs/user-guide/10-hooks.md): hook files are discovered from
- * `~/.grok/hooks/*.json` in the shape
- * `{"hooks":{"PreToolUse":[{"matcher":"","hooks":[{"type":"command","command":"...","timeout":30}]}], ...}}`,
- * and each hook process receives a JSON envelope on stdin with camelCase
- * keys (`hookEventName`, `sessionId`, `cwd`, `toolName`, `toolInput`,
- * `toolResult`, ...).
+ * agy's hook system resembles Claude Code's but differs in two ways that
+ * matter here, both taken from the CLI's own bundled "Lifecycle Hooks
+ * (hooks.json)" reference (embedded in the `agy` binary; see also
+ * https://antigravity.google/docs/hooks):
+ *
+ *  1. The file is keyed by *hook namespace*, not by event. The shared global
+ *     file `~/.gemini/config/hooks.json` looks like
+ *
+ *       {
+ *         "<namespace>": {
+ *           "enabled": true,
+ *           "PostToolUse": [
+ *             { "matcher": "*", "hooks": [{ "type": "command", "command": "...", "timeout": 30 }] }
+ *           ],
+ *           "Stop": [ { "type": "command", "command": "..." } ]
+ *         }
+ *       }
+ *
+ *     Other namespaces belong to other tools, so xirp merges strictly under
+ *     its own `xirp` key and never touches theirs.
+ *
+ *  2. The per-event value shape is not uniform. `PreToolUse` and `PostToolUse`
+ *     are *grouped*: a list of `{matcher, hooks:[handler]}` objects, where the
+ *     matcher is a regex over the tool name ("*" or "" means every tool).
+ *     `PreInvocation`, `PostInvocation` and `Stop` are *flat*: a list of
+ *     handler objects directly, with no matcher.
+ *
+ * The stdin envelope is protojson, so its keys are camelCase. Every payload
+ * carries `conversationId`, `workspacePaths`, `transcriptPath`,
+ * `artifactDirectoryPath` and `modelName`; `PreToolUse` adds `toolCall`
+ * ({name, args}) and `stepIdx`, `PostToolUse` adds `stepIdx` and an optional
+ * `error`. `conversationId` is therefore the session-id field squab's hook
+ * script must read.
  *
  * squab's canonical hook protocol is an optional trio an adapter attaches
  * all-or-nothing:
@@ -28,6 +54,14 @@ import { grokHome } from "./paths.js";
  * cannot be imported directly, so this module reimplements the minimal
  * equivalent, matching squab's own generator output field-for-field so the
  * installed hooks are exactly what squab expects to find.
+ *
+ * One part of squab's generator is deliberately left out: the background-child
+ * classification that inspects `agent_id`, `is_subagent` and `transcript_path`
+ * to decide whether a hook fired inside a subagent. Those are snake_case
+ * Claude/Codex field names; agy's protojson envelope emits none of them, so
+ * the classifier would return "topLevel" for every agy payload it ever sees.
+ * Emitting the same envelope without the dead branch keeps the output
+ * identical and the script readable.
  */
 
 const HOOK_SCHEMA = "squab.hook/v1";
@@ -117,9 +151,9 @@ function escapeForSingleQuotedLiteral(value) {
  * script that reads the hook envelope on stdin, wraps it in a
  * `squab.hook/v1` envelope, and POSTs it to the daemon. Fire-and-forget for
  * every event except `permissionRequest`, which waits for the daemon's
- * response and echoes it to stdout. Grok never reaches the permissionRequest
- * branch today since it is not in grok's supported set below, but the
- * generator stays general so it matches squab's own shape.
+ * response and echoes it to stdout. antigravity never reaches the
+ * permissionRequest branch today since it is not in its supported set below,
+ * but the generator stays general so it matches squab's own shape.
  */
 function buildCanonicalHookScript(agent, event, opts, config) {
   if (!AGENT_OR_EVENT_SLUG_RE.test(agent)) {
@@ -128,7 +162,8 @@ function buildCanonicalHookScript(agent, event, opts, config) {
   if (!AGENT_OR_EVENT_SLUG_RE.test(event)) {
     throw new Error(`buildCanonicalHookScript: event "${preview(event)}" is not a safe slug`);
   }
-  const permissionRequestTimeoutS = config?.overrideTimeoutS ?? config?.permissionRequestTimeoutS ?? 30;
+  const permissionRequestTimeoutS =
+    config?.overrideTimeoutS ?? config?.permissionRequestTimeoutS ?? 30;
   const fireAndForgetTimeoutS = config?.overrideTimeoutS ?? config?.fireAndForgetTimeoutS ?? 5;
   const sessionIdField = config?.sessionIdField ?? "session_id";
   if (!SESSION_ID_FIELD_RE.test(sessionIdField)) {
@@ -137,7 +172,8 @@ function buildCanonicalHookScript(agent, event, opts, config) {
     );
   }
   const daemonUrl = escapeForSingleQuotedLiteral(String(opts.daemonUrl));
-  const authToken = opts.authToken !== undefined ? escapeForSingleQuotedLiteral(String(opts.authToken)) : "";
+  const authToken =
+    opts.authToken !== undefined ? escapeForSingleQuotedLiteral(String(opts.authToken)) : "";
   const isPermissionRequest = event === "permissionRequest";
   const timeoutS = isPermissionRequest ? permissionRequestTimeoutS : fireAndForgetTimeoutS;
   if (!Number.isInteger(timeoutS) || timeoutS < 1 || timeoutS > MAX_TIMEOUT_S) {
@@ -190,97 +226,6 @@ function buildCanonicalHookScript(agent, event, opts, config) {
  const chunks = [];
  const hookDeadline = setTimeout(() => process.exit(0), ${timeoutMs});
  hookDeadline.unref();
- const TRANSCRIPT_CHUNK_BYTES = 64 * 1024;
- const TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024;
- const TRANSCRIPT_PROBE_TIMEOUT_MS = 500;
- const TRANSCRIPT_RETRY_DELAYS_MS = [0, 50, 100];
- const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
- function withTimeout(promise, timeoutMs) {
-   return new Promise((resolve) => {
-     const timer = setTimeout(() => resolve({ state: 'unknown' }), timeoutMs);
-     timer.unref();
-     promise.then(
-       (value) => { clearTimeout(timer); resolve(value); },
-       () => { clearTimeout(timer); resolve({ state: 'unknown' }); },
-     );
-   });
- }
-
- async function readTranscriptMetadata(transcriptPath) {
-   let handle;
-   try {
-     const [{ open }, { constants }] = await Promise.all([import('fs/promises'), import('fs')]);
-     const flags = constants.O_RDONLY | (constants.O_NONBLOCK || 0) | (constants.O_NOFOLLOW || 0);
-     handle = await open(transcriptPath, flags);
-     const stat = await handle.stat();
-     if (!stat.isFile()) return { state: 'unknown' };
-
-     const buffers = [];
-     let position = 0;
-     while (position < TRANSCRIPT_MAX_BYTES) {
-       const buffer = Buffer.alloc(Math.min(TRANSCRIPT_CHUNK_BYTES, TRANSCRIPT_MAX_BYTES - position));
-       const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-       if (bytesRead === 0) break;
-       const chunk = buffer.subarray(0, bytesRead);
-       const newline = chunk.indexOf(10);
-       buffers.push(newline >= 0 ? chunk.subarray(0, newline) : chunk);
-       position += bytesRead;
-       if (newline >= 0 || bytesRead < buffer.length) break;
-     }
-     if (buffers.length === 0) return { state: 'unknown' };
-     const metadata = JSON.parse(Buffer.concat(buffers).toString('utf8').replace(/\r$/, ''));
-     return { state: 'known', metadata };
-   } catch (e) {
-     return { state: 'unknown' };
-   } finally {
-     if (handle) await handle.close().catch(() => {});
-   }
- }
-
- async function classifyBackgroundChild(payload) {
-   if (process.env.SNIPE_BG_TASK_ID) return 'child';
-   if (!payload || typeof payload !== 'object') return 'topLevel';
-
-   for (const key of ['agent_id', 'parent_agent_id']) {
-     if (typeof payload[key] === 'string' && payload[key].length > 0) return 'child';
-   }
-   if (payload.is_subagent === true || payload.is_background === true || payload.background === true) {
-     return 'child';
-   }
-
-   const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
-   if (!transcriptPath) return 'topLevel';
-   // Match only known child transcript suffixes. Ancestor directories are
-   // user-controlled and may legitimately be named "subagents" or "bg-*".
-   if (/[\/]subagents[\/][^\/]+\.jsonl$/.test(transcriptPath)) return 'child';
-   if (/[\/]chats[\/][^\/]+[\/][^\/]+\.jsonl$/.test(transcriptPath)) return 'child';
-
-   // Claude and Snipe expose explicit markers above. Other/future adapters do
-   // not have a known transcript metadata contract, so their ordinary paths
-   // are conclusively top-level rather than guessed from file contents.
-   if (AGENT !== 'codex' && AGENT !== 'gemini') return 'topLevel';
-
-   // Codex stores main and child rollouts in the same date-sharded directory,
-   // so the path alone cannot distinguish them. Its first session_meta line
-   // records payload.source.subagent. Gemini likewise records kind=subagent
-   // in its init line. Retry briefly because SessionStart can race transcript
-   // creation. Unknown metadata suppresses lifecycle attribution rather than
-   // failing open and assigning a possible child event to its parent.
-   for (const retryDelay of TRANSCRIPT_RETRY_DELAYS_MS) {
-     if (retryDelay) await delay(retryDelay);
-     const result = await withTimeout(
-       readTranscriptMetadata(transcriptPath),
-       TRANSCRIPT_PROBE_TIMEOUT_MS,
-     );
-     if (result.state !== 'known') continue;
-     const metadata = result.metadata;
-     const source = metadata && metadata.payload && metadata.payload.source;
-     return metadata?.kind === 'subagent' || !!(source && typeof source === 'object' && source.subagent)
-       ? 'child'
-       : 'topLevel';
-   }
-   return 'unknown';
- }
  process.stdin.on('data', (c) => chunks.push(c));
  process.stdin.on('end', async () => {
    const raw = Buffer.concat(chunks).toString('utf8');
@@ -288,7 +233,6 @@ function buildCanonicalHookScript(agent, event, opts, config) {
    try { payload = JSON.parse(raw); } catch (e) { payload = {}; }
    const sessionId = (payload && typeof payload.${sessionIdField} === 'string') ? payload.${sessionIdField} : '';
    const inheritedChirpSessionId = (process.env.CHIRP_NOTIFICATION_ID || '').replace(/[\r\n]/g, '');
-   const childClassification = await classifyBackgroundChild(payload);
    const ts = new Date().toISOString();
    const envelopeObject = {
      schema: '${HOOK_SCHEMA}',
@@ -298,15 +242,7 @@ function buildCanonicalHookScript(agent, event, opts, config) {
      sessionId: sessionId,
      payload: payload
    };
-   if (childClassification === 'child') {
-     envelopeObject.backgroundChild = true;
-     if (inheritedChirpSessionId) envelopeObject.parentChirpSessionId = inheritedChirpSessionId;
-   } else if (childClassification === 'unknown') {
-     envelopeObject.lifecycleAttribution = 'unknown';
-     if (inheritedChirpSessionId) envelopeObject.parentChirpSessionId = inheritedChirpSessionId;
-   } else if (inheritedChirpSessionId) {
-     envelopeObject.chirpSessionId = inheritedChirpSessionId;
-   }
+   if (inheritedChirpSessionId) envelopeObject.chirpSessionId = inheritedChirpSessionId;
    const envelope = JSON.stringify(envelopeObject);
    const { URL: NodeURL } = await import('url');
    const url = new NodeURL(DAEMON_URL);
@@ -328,30 +264,38 @@ function buildCanonicalHookScript(agent, event, opts, config) {
 }
 
 /**
- * Native hook event names each canonical HookEvent maps to. These are
- * Claude's own PascalCase names, which grok's hook file format also uses
- * since it is explicitly Claude-Code compatible (PreToolUse, PostToolUse,
- * Stop, SessionStart, ...).
+ * Native hook event names each canonical HookEvent maps to. agy exposes five
+ * lifecycle events -- PreToolUse, PostToolUse, PreInvocation, PostInvocation
+ * and Stop -- of which three line up with a canonical squab event. There is no
+ * native session-start, notification, status-line or standalone permission
+ * event: permission decisions are returned from PreToolUse itself, which is
+ * already claimed by `preToolUse`, so `permissionRequest` stays unsupported
+ * rather than double-installing on the same native event.
  */
 const CANONICAL_TO_NATIVE_EVENT_NAME = Object.freeze({
-  notification: "Notification",
   preToolUse: "PreToolUse",
   postToolUse: "PostToolUse",
   stop: "Stop",
-  sessionStart: "SessionStart",
-  permissionRequest: "PermissionRequest",
 });
 
+/** Native events whose value is a list of `{matcher, hooks:[...]}` groups. */
+const GROUPED_NATIVE_EVENTS = new Set(["PreToolUse", "PostToolUse"]);
+
+/** The hook namespace xirp owns inside the shared hooks.json. */
+const HOOK_NAMESPACE = "xirp";
+
+/** Matcher that selects every tool, per agy's hook reference. */
+const MATCH_ALL_TOOLS = "*";
+
 /**
- * squab's `buildCanonicalHookInstallEntry`: describes where/how chirp should
- * merge one hook handler into an agent's own settings file. squab owns
+ * squab's `buildCanonicalHookInstallEntry`, adapted to agy's namespaced file:
+ * describes where/how chirp should merge one hook handler. squab owns
  * create-if-missing and the actual merge; this only returns the merge
- * instruction. The fragment shape (`{matcher, hooks:[{type,command,timeout?}]}`)
- * matches grok's `~/.grok/hooks/*.json` format (Claude-Code compatible),
- * unlike e.g. Cursor's flatter `{command, timeout?}` fragment for
- * `~/.cursor/hooks.json`.
+ * instruction. The mergePath is rooted at xirp's own namespace so sibling
+ * namespaces written by other tools survive untouched, and the fragment is
+ * grouped or flat according to the event.
  */
-function buildCanonicalHookInstallEntry(settingsFile, event, scriptPath, mapping, opts) {
+function buildCanonicalHookInstallEntry(settingsFilePath, event, scriptPath, mapping, opts) {
   const eventMapping = mapping ?? CANONICAL_TO_NATIVE_EVENT_NAME;
   const nativeEventName = eventMapping[event];
   if (nativeEventName === undefined) {
@@ -369,51 +313,71 @@ function buildCanonicalHookInstallEntry(settingsFile, event, scriptPath, mapping
     }
     handler.timeout = override;
   }
+  const fragment = GROUPED_NATIVE_EVENTS.has(nativeEventName)
+    ? { matcher: MATCH_ALL_TOOLS, hooks: [handler] }
+    : handler;
   return {
-    settingsFile,
-    mergePath: ["hooks", nativeEventName],
-    fragment: { matcher: ".*", hooks: [handler] },
+    settingsFile: settingsFilePath,
+    mergePath: [HOOK_NAMESPACE, nativeEventName],
+    fragment,
     mergeOp: "array-append",
   };
 }
 
-const GROK_HOOKS_SETTINGS_FILENAME = "xirp.json";
-const GROK_HOOK_CAPABILITIES_LAST_UPDATED = "2026-09-12";
+const ANTIGRAVITY_HOOK_CAPABILITIES_LAST_UPDATED = "2026-09-13";
 
-/** Events grok's native hook surface does not expose to squab today. */
-const GROK_UNSUPPORTED_HOOK_EVENTS = new Set(["notification", "permissionRequest", "statusLine"]);
+/** Events agy's native hook surface does not expose to squab today. */
+const ANTIGRAVITY_UNSUPPORTED_HOOK_EVENTS = new Set([
+  "notification",
+  "sessionStart",
+  "permissionRequest",
+  "statusLine",
+]);
 
-const grokHookCapabilities = defineHookCapabilities(GROK_HOOK_CAPABILITIES_LAST_UPDATED, {
-  notification: false,
-  preToolUse: true,
-  postToolUse: true,
-  stop: true,
-  sessionStart: true,
-  permissionRequest: false,
-  statusLine: false,
-});
+const antigravityHookCapabilities = defineHookCapabilities(
+  ANTIGRAVITY_HOOK_CAPABILITIES_LAST_UPDATED,
+  {
+    notification: false,
+    preToolUse: true,
+    postToolUse: true,
+    stop: true,
+    sessionStart: false,
+    permissionRequest: false,
+    statusLine: false,
+  },
+);
 
-/** ~/.grok/hooks/xirp.json, honoring $GROK_HOME like the rest of grok's state. */
-function grokHooksSettingsFile() {
-  return path.join(grokHome(), "hooks", GROK_HOOKS_SETTINGS_FILENAME);
+/**
+ * The shared hooks file both the TUI and the backend read:
+ * `~/.gemini/config/hooks.json`. It is a sibling of the CLI's own state
+ * directory, so it is derived from agyHome()'s parent -- which keeps a
+ * relocated home (tests, sandboxes) self-consistent.
+ */
+function antigravityHooksSettingsFile() {
+  return path.join(path.dirname(agyHome()), "config", "hooks.json");
 }
 
-function grokHookScript(event, opts) {
-  if (GROK_UNSUPPORTED_HOOK_EVENTS.has(event)) {
-    throw new Error(`grok hookScript: ${event} is not exposed by Grok Build's native hook surface`);
+function antigravityHookScript(event, opts) {
+  if (ANTIGRAVITY_UNSUPPORTED_HOOK_EVENTS.has(event)) {
+    throw new Error(
+      `antigravity hookScript: ${event} is not exposed by the Antigravity CLI's native hook surface`,
+    );
   }
-  return buildCanonicalHookScript("grok", event, opts, {
-    sessionIdField: "sessionId",
+  return buildCanonicalHookScript("antigravity", event, opts, {
+    // protojson envelope: every hook payload carries `conversationId`.
+    sessionIdField: "conversationId",
     overrideTimeoutS: opts?.timeoutOverrides?.[event],
   });
 }
 
-function grokHookInstallEntry(event, scriptPath, opts) {
-  if (GROK_UNSUPPORTED_HOOK_EVENTS.has(event)) {
-    throw new Error(`grok hookInstallEntry: ${event} is not exposed by Grok Build's native hook surface`);
+function antigravityHookInstallEntry(event, scriptPath, opts) {
+  if (ANTIGRAVITY_UNSUPPORTED_HOOK_EVENTS.has(event)) {
+    throw new Error(
+      `antigravity hookInstallEntry: ${event} is not exposed by the Antigravity CLI's native hook surface`,
+    );
   }
   return buildCanonicalHookInstallEntry(
-    grokHooksSettingsFile(),
+    antigravityHooksSettingsFile(),
     event,
     scriptPath,
     CANONICAL_TO_NATIVE_EVENT_NAME,
@@ -424,13 +388,16 @@ function grokHookInstallEntry(event, scriptPath, opts) {
 export {
   HOOK_SCHEMA,
   HOOK_EVENTS,
+  HOOK_NAMESPACE,
+  MATCH_ALL_TOOLS,
+  GROUPED_NATIVE_EVENTS,
   defineHookCapabilities,
   buildCanonicalHookScript,
   buildCanonicalHookInstallEntry,
   CANONICAL_TO_NATIVE_EVENT_NAME,
-  GROK_UNSUPPORTED_HOOK_EVENTS,
-  grokHookCapabilities,
-  grokHooksSettingsFile,
-  grokHookScript,
-  grokHookInstallEntry,
+  ANTIGRAVITY_UNSUPPORTED_HOOK_EVENTS,
+  antigravityHookCapabilities,
+  antigravityHooksSettingsFile,
+  antigravityHookScript,
+  antigravityHookInstallEntry,
 };

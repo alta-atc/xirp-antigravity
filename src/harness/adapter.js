@@ -2,21 +2,27 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 import {
-  SESSION_FILE,
-  CWD_MARKER_FILE,
-  MAX_BUCKET_BYTES,
-  grokHome,
-  bucketDirFor,
-  resolveBucketDir,
-  sessionDirFor,
-  sessionFileIn,
-  summaryFileIn,
-  updatesFileIn,
-  sessionDirOf,
-  sessionIdFromPath,
-  listSessionDirs,
-  listBucketDirs,
-  newestSessionFile,
+  TRANSCRIPT_FILE,
+  CLI_APP_DATA_DIRS,
+  agyHome,
+  handoffDir,
+  handoffTranscriptFile,
+  handoffMarkdownFile,
+  handoffSessionFile,
+  handoffRoot,
+  isHandoffTranscriptPath,
+  brainDir,
+  conversationDir,
+  transcriptFileFor,
+  conversationIdFromPath,
+  lastConversationsFile,
+  metadataFile,
+  settingsFile,
+  isFile,
+  listConversationIds,
+  listHandoffIds,
+  newestTranscript,
+  pathFromFileUri,
 } from "./paths.js";
 
 import {
@@ -24,37 +30,32 @@ import {
   isPlainObject,
   asString,
   emptyUsage,
-  addUsage,
-  inspectHistory,
-  buildTimeline,
-  emptyTimeline,
-  historyToMessages,
-  messagesToHistory,
+  transcriptToMessages,
+  messagesToTranscript,
+  messagesToMarkdown,
   toParsedMessages,
   applyParseOpts,
 } from "./transcript.js";
 
-import { grokHookCapabilities, grokHookScript, grokHookInstallEntry } from "./hooks.js";
+import {
+  antigravityHookCapabilities,
+  antigravityHookScript,
+  antigravityHookInstallEntry,
+} from "./hooks.js";
 
-const AGENT = "grok";
+const AGENT = "antigravity";
 const PARSED_SCHEMA = "squab.session-parsed/v1";
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
-const DEFAULT_MODEL = "grok-4.6";
-const DEFAULT_SYSTEM_PROMPT =
-  "You are Grok Build, xAI's coding agent, running in the user's terminal.";
-const SYSTEM_SEED_SCAN_LIMIT = 20;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const HANDOFF_SOURCE = "xirp-handoff";
 
-const RESUME_CONFLICT_FLAGS = new Set([
-  "--session-id",
-  "-s",
-  "--resume",
-  "-r",
-  "-c",
-  "--continue",
-  "--fork-session",
-]);
+/**
+ * The prompt a seeded launch starts with. `agy -i "<prompt>"` runs it once and
+ * then stays interactive, which is exactly the handoff shape we want.
+ */
+function handoffPrompt(markdownPath) {
+  return `Continue the conversation whose transcript is in ${markdownPath}. Read it first, then carry on from where it left off.`;
+}
 
 function fail(name, message) {
   const error = new Error(message);
@@ -81,323 +82,372 @@ async function readJsonOrNull(filePath) {
   }
 }
 
-async function readSummaryFor(sessionFilePath) {
-  return readJsonOrNull(summaryFileIn(sessionDirOf(sessionFilePath)));
-}
-
-function summaryInfo(summary) {
-  return summary && isPlainObject(summary.info) ? summary.info : null;
-}
-
-async function timelineFor(sessionFilePath) {
-  const text = await readTextOrNull(updatesFileIn(sessionDirOf(sessionFilePath)));
-  return text === null ? emptyTimeline() : buildTimeline(text);
-}
-
-async function isFile(candidate) {
+/** The cwd spellings a conversation might be recorded under (raw and resolved). */
+async function cwdVariants(cwd) {
+  const variants = [];
+  const push = (value) => {
+    if (typeof value === "string" && value && !variants.includes(value)) variants.push(value);
+  };
+  push(cwd);
   try {
-    return (await fsp.lstat(candidate)).isFile();
+    push(await fsp.realpath(cwd));
   } catch {
-    return false;
+    /* cwd may not exist yet; the raw spelling is still worth looking up */
   }
+  return variants;
+}
+
+/** cache/last_conversations.json: { "<abs cwd>": "<conversation-uuid>" }. */
+async function readLastConversations() {
+  return (await readJsonOrNull(lastConversationsFile())) ?? {};
 }
 
 /**
- * Reuse the system prompt of the most recently touched real Grok session so a
- * handed-off transcript keeps Grok's own instructions. Falls back to a short
- * generic prompt when no session exists yet.
+ * cache/conversation_metadata.json summaries, restricted to conversations that
+ * belong to the CLI. `AppDataDir: "antigravity"` marks an IDE conversation,
+ * whose transcript does not live under this home at all.
  */
-async function seedSystemPrompt() {
-  const candidates = [];
-  for (const bucket of await listBucketDirs()) {
-    for (const dir of await listSessionDirs(bucket)) {
-      const file = sessionFileIn(dir);
-      try {
-        const stat = await fsp.stat(file);
-        if (stat.isFile()) candidates.push({ path: file, mtime: stat.mtimeMs });
-      } catch {
-        /* ignore unreadable session dirs */
-      }
-    }
+async function readCliConversationSummaries() {
+  const metadata = await readJsonOrNull(metadataFile());
+  const conversations = isPlainObject(metadata?.conversations) ? metadata.conversations : {};
+  const out = [];
+  for (const [id, entry] of Object.entries(conversations)) {
+    if (!isPlainObject(entry)) continue;
+    const summary = isPlainObject(entry.summary) ? entry.summary : null;
+    if (!summary) continue;
+    if (!CLI_APP_DATA_DIRS.has(asString(summary.AppDataDir))) continue;
+    out.push({ id: asString(summary.ID) || id, summary });
   }
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  for (const candidate of candidates.slice(0, SYSTEM_SEED_SCAN_LIMIT)) {
-    const text = await readTextOrNull(candidate.path);
-    if (!text) continue;
-    const firstLine = text.split("\n", 1)[0];
-    try {
-      const parsed = JSON.parse(firstLine);
-      if (isPlainObject(parsed) && parsed.type === "system" && typeof parsed.content === "string") {
-        return parsed.content;
-      }
-    } catch {
-      /* not a system line; try the next session */
-    }
-  }
-  return DEFAULT_SYSTEM_PROMPT;
+  return out;
 }
 
-/** Ensure a long-path bucket dir carries the ".cwd" marker Grok looks for. */
-async function ensureCwdMarker(bucketDir, cwd) {
-  if (Buffer.byteLength(encodeURIComponent(cwd)) <= MAX_BUCKET_BYTES) return;
-  const marker = path.join(bucketDir, CWD_MARKER_FILE);
-  try {
-    await fsp.writeFile(marker, `${cwd}\n`, { mode: FILE_MODE });
-  } catch {
-    /* best effort: the direct bucket name still resolves */
-  }
+/** Absolute workspace paths recorded on a conversation summary. */
+function workspacePathsOf(summary) {
+  const uris = Array.isArray(summary?.WorkspaceURIs) ? summary.WorkspaceURIs : [];
+  return uris.map((uri) => pathFromFileUri(uri)).filter((value) => value !== null);
 }
 
-async function writeSessionFiles(bucketDir, cwd, sessionId, messages) {
-  const sessionDir = sessionDirFor(bucketDir, sessionId);
-  await fsp.mkdir(sessionDir, { recursive: true, mode: DIR_MODE });
-  await ensureCwdMarker(bucketDir, cwd);
+/** The handoff pseudo-session descriptor for an id, or null. */
+async function readHandoffSession(sessionId) {
+  return readJsonOrNull(handoffSessionFile(sessionId));
+}
 
-  const now = new Date().toISOString();
-  const historyLines = messagesToHistory(messages, { modelId: DEFAULT_MODEL });
-  const summary = {
-    info: { id: sessionId, cwd },
-    session_summary: "",
-    created_at: now,
-    updated_at: now,
-    last_active_at: now,
-    num_messages: 0,
-    num_chat_messages: historyLines.length,
-    current_model_id: DEFAULT_MODEL,
-    chat_format_version: 1,
-    grok_home: grokHome(),
-    agent_name: "general-purpose",
-    sandbox_profile: "off",
-    reasoning_effort: "high",
-  };
-  const systemLine = { type: "system", content: await seedSystemPrompt() };
-  const body = [systemLine, ...historyLines].map((line) => JSON.stringify(line)).join("\n");
+/** Transcript path for a conversation id, only when it really exists. */
+async function existingTranscriptFor(conversationId) {
+  if (!conversationId) return null;
+  const candidate = transcriptFileFor(conversationId);
+  return (await isFile(candidate)) ? candidate : null;
+}
 
-  await fsp.writeFile(summaryFileIn(sessionDir), `${JSON.stringify(summary, null, 2)}\n`, {
+/**
+ * Write a handoff pseudo-session and return its transcript path.
+ *
+ * Why this exists instead of fabricating a native conversation: an agy
+ * conversation is server-synced state backed by SQLite and protobuf, and the
+ * JSONL under `brain/<id>/.system_generated/logs/` is a *log* of that state,
+ * not its source of truth. Dropping a hand-written directory into `brain/`
+ * would not produce a conversation agy can resume, and the CLI offers no flag
+ * or environment variable that presets a conversation id on a fresh launch.
+ * So a handoff is a *seeded launch*: xirp renders the incoming transcript to
+ * Markdown, and the resume command tells a brand-new agy conversation to read
+ * that file and continue. The sibling transcript_full.jsonl uses agy's own
+ * step shape so readNative / readEmbeddedSessionId / parseSessionFile treat a
+ * handoff exactly like a real session.
+ */
+async function writeHandoffSession(messages, cwd, sessionId) {
+  const dir = handoffDir(sessionId);
+  await fsp.mkdir(dir, { recursive: true, mode: DIR_MODE });
+
+  const list = Array.isArray(messages) ? messages : [];
+  const markdownPath = handoffMarkdownFile(sessionId);
+  const transcriptPath = handoffTranscriptFile(sessionId);
+
+  const steps = messagesToTranscript(list);
+  const jsonl = steps.map((step) => JSON.stringify(step)).join("\n");
+
+  await fsp.writeFile(markdownPath, messagesToMarkdown(list, { cwd, title: "Handed-off conversation" }), {
     mode: FILE_MODE,
   });
-  const sessionFile = sessionFileIn(sessionDir);
-  await fsp.writeFile(sessionFile, `${body}\n`, { mode: FILE_MODE });
-  return sessionFile;
+  await fsp.writeFile(transcriptPath, jsonl.length > 0 ? `${jsonl}\n` : "", { mode: FILE_MODE });
+  await fsp.writeFile(
+    handoffSessionFile(sessionId),
+    `${JSON.stringify({ id: sessionId, cwd, createdAt: new Date().toISOString(), source: HANDOFF_SOURCE }, null, 2)}\n`,
+    { mode: FILE_MODE },
+  );
+
+  return transcriptPath;
 }
 
+/**
+ * Settings surfaces of the Antigravity CLI, as documented by the CLI's own
+ * bundled reference (`agy`'s antigravity_guide skill and its embedded hooks /
+ * customization docs). Only surfaces those docs substantiate are listed.
+ */
 const settingsCatalogItems = [
   {
     id: "config",
-    label: "config.toml",
-    description: "Global Grok configuration",
+    label: "settings.json",
+    description: "Global Antigravity CLI settings (model, verbosity, permissions)",
     scope: "global",
-    format: "toml",
-    path: "~/.grok/config.toml",
+    format: "json",
+    path: "~/.gemini/antigravity-cli/settings.json",
   },
   {
-    id: "config",
-    label: "config.toml",
-    description: "Project Grok configuration",
-    scope: "project",
-    format: "toml",
-    path: "<cwd>/.grok/config.toml",
+    id: "hooks",
+    label: "hooks.json",
+    description: "Global lifecycle hooks, shared by the CLI and the backend",
+    scope: "global",
+    format: "json",
+    path: "~/.gemini/config/hooks.json",
+  },
+  {
+    id: "mcp",
+    label: "mcp_config.json",
+    description: "Global MCP server definitions",
+    scope: "global",
+    format: "json",
+    path: "~/.gemini/config/mcp_config.json",
+  },
+  {
+    id: "skills",
+    label: "skills",
+    description: "Global skills directory",
+    scope: "global",
+    format: "directory",
+    path: "~/.gemini/config/skills",
   },
   {
     id: "instructions",
     label: "AGENTS.md",
-    description: "Project Grok instructions",
+    description: "Project rules loaded as context",
     scope: "project",
     format: "markdown",
     path: "<cwd>/AGENTS.md",
   },
   {
     id: "hooks",
-    label: "xirp.json",
-    description: "Grok hook definitions installed by xirp",
-    scope: "global",
-    format: "json",
-    path: "~/.grok/hooks/xirp.json",
-  },
-  {
-    id: "mcp",
-    label: ".mcp.json",
-    description: "Project MCP server definitions",
+    label: ".agents/hooks.json",
+    description: "Workspace-local lifecycle hooks",
     scope: "project",
     format: "json",
-    path: "<cwd>/.mcp.json",
+    path: "<cwd>/.agents/hooks.json",
   },
 ];
 
-const grokAdapter = {
+const antigravityAdapter = {
   agent: AGENT,
 
-  sessionRoot(cwd) {
-    return bucketDirFor(cwd);
+  /**
+   * Conversations are global, so every cwd shares one root. squab hands this
+   * value back as `dir` to writeNative / forkNative, both of which ignore it:
+   * a handoff cannot live in `brain/` (see writeHandoffSession).
+   */
+  sessionRoot() {
+    return brainDir();
   },
 
+  /**
+   * Most recent conversation for a working directory.
+   *
+   * `cache/last_conversations.json` is authoritative and is rewritten on every
+   * launch, so it is tried first. `cache/conversation_metadata.json` is only
+   * refreshed when the TUI lists conversations and can be days stale, so it is
+   * a fallback. A handoff pseudo-session is the last resort, which is what
+   * makes a just-seeded session discoverable before agy has created a real
+   * conversation of its own.
+   */
   async locateLatest(cwd) {
-    const bucketDir = await resolveBucketDir(cwd);
-    if (!bucketDir) return null;
-    return newestSessionFile(await listSessionDirs(bucketDir));
+    const variants = await cwdVariants(cwd);
+
+    const lastConversations = await readLastConversations();
+    for (const variant of variants) {
+      const found = await existingTranscriptFor(asString(lastConversations[variant]));
+      if (found) return found;
+    }
+
+    const fromMetadata = [];
+    for (const { id, summary } of await readCliConversationSummaries()) {
+      if (!workspacePathsOf(summary).some((workspace) => variants.includes(workspace))) continue;
+      const found = await existingTranscriptFor(id);
+      if (found) fromMetadata.push(found);
+    }
+    if (fromMetadata.length > 0) return newestTranscript(fromMetadata);
+
+    const fromHandoff = [];
+    for (const id of await listHandoffIds()) {
+      const session = await readHandoffSession(id);
+      if (!session || !variants.includes(asString(session.cwd))) continue;
+      const candidate = handoffTranscriptFile(id);
+      if (await isFile(candidate)) fromHandoff.push(candidate);
+    }
+    if (fromHandoff.length > 0) return newestTranscript(fromHandoff);
+
+    return null;
   },
 
+  /**
+   * agy conversations are global rather than scoped to a working directory, so
+   * cwd is not consulted: an id either names a conversation on this machine or
+   * it does not.
+   */
   async findBySessionId(cwd, sessionId) {
     if (!sessionId) return null;
-    const bucketDir = await resolveBucketDir(cwd);
-    if (!bucketDir) return null;
-    const candidate = sessionFileIn(sessionDirFor(bucketDir, sessionId));
-    return (await isFile(candidate)) ? candidate : null;
+    const handoff = handoffTranscriptFile(sessionId);
+    if (await isFile(handoff)) return handoff;
+    return existingTranscriptFor(sessionId);
   },
 
   async findImportTranscript(cwd, requestedSessionId) {
     if (!requestedSessionId) {
       const latest = await this.locateLatest(cwd);
       if (!latest) return null;
-      const summary = await readSummaryFor(latest);
-      const info = summaryInfo(summary);
+      const id = conversationIdFromPath(latest);
       return {
         path: latest,
-        root: sessionDirOf(latest),
-        nativeSessionId: asString(info?.id) || sessionIdFromPath(latest),
-        nativeCwd: asString(info?.cwd) || null,
+        root: isHandoffTranscriptPath(latest) ? handoffDir(id) : conversationDir(id),
+        nativeSessionId: id,
+        nativeCwd: await this.nativeCwd(latest),
       };
     }
 
     const prefix = requestedSessionId.toLowerCase();
     const matches = [];
-    for (const bucketDir of await listBucketDirs()) {
-      for (const sessionDir of await listSessionDirs(bucketDir)) {
-        const id = path.basename(sessionDir);
-        if (!id.toLowerCase().startsWith(prefix)) continue;
-        const candidate = sessionFileIn(sessionDir);
-        if (!(await isFile(candidate))) continue;
-        matches.push({ path: candidate, root: sessionDir, nativeSessionId: id });
-      }
+    for (const id of await listConversationIds()) {
+      if (!id.toLowerCase().startsWith(prefix)) continue;
+      const candidate = await existingTranscriptFor(id);
+      if (!candidate) continue;
+      matches.push({ path: candidate, root: conversationDir(id), nativeSessionId: id });
+    }
+    for (const id of await listHandoffIds()) {
+      if (!id.toLowerCase().startsWith(prefix)) continue;
+      const candidate = handoffTranscriptFile(id);
+      if (!(await isFile(candidate))) continue;
+      matches.push({ path: candidate, root: handoffDir(id), nativeSessionId: id });
     }
     if (matches.length > 1) {
       throw new Error(
-        `Multiple grok sessions match "${requestedSessionId}"; use a longer session ID`,
+        `Multiple antigravity conversations match "${requestedSessionId}"; use a longer conversation ID`,
       );
     }
     if (matches.length === 0) return null;
-    const summary = await readSummaryFor(matches[0].path);
-    const info = summaryInfo(summary);
-    return { ...matches[0], nativeCwd: asString(info?.cwd) || null };
+    return { ...matches[0], nativeCwd: await this.nativeCwd(matches[0].path) };
+  },
+
+  /**
+   * The working directory a transcript was recorded in, from the handoff
+   * descriptor, the live cwd map, or the (possibly stale) metadata cache.
+   */
+  async nativeCwd(sessionFilePath) {
+    const id = conversationIdFromPath(sessionFilePath);
+    if (!id) return null;
+
+    if (isHandoffTranscriptPath(sessionFilePath)) {
+      const session = await readHandoffSession(id);
+      return asString(session?.cwd) || null;
+    }
+
+    const lastConversations = await readLastConversations();
+    for (const [cwd, conversationId] of Object.entries(lastConversations)) {
+      if (conversationId === id) return cwd;
+    }
+
+    for (const entry of await readCliConversationSummaries()) {
+      if (entry.id !== id) continue;
+      const [first] = workspacePathsOf(entry.summary);
+      return first ?? null;
+    }
+    return null;
   },
 
   async readEmbeddedSessionId(sessionFilePath) {
-    const summary = await readSummaryFor(sessionFilePath);
-    const info = summaryInfo(summary);
-    const fromSummary = asString(info?.id);
-    if (fromSummary) return fromSummary;
-    return sessionIdFromPath(sessionFilePath) || null;
+    const id = conversationIdFromPath(sessionFilePath);
+    if (isHandoffTranscriptPath(sessionFilePath)) {
+      const session = await readHandoffSession(id);
+      return asString(session?.id) || id || null;
+    }
+    return id || null;
   },
 
   async readNative(sessionFilePath) {
     const text = await readTextOrNull(sessionFilePath);
     if (text === null) return [];
-    const summary = await readSummaryFor(sessionFilePath);
-    const timeline = await timelineFor(sessionFilePath);
-    const { messages } = historyToMessages(text, {
-      timeline,
-      baseTime: asString(summary?.created_at) || EPOCH_ZERO,
-    });
-    return messages;
+    return transcriptToMessages(text).messages;
   },
 
+  /**
+   * Hand a transcript from another agent to agy. `dir` (squab's sessionRoot)
+   * is ignored: the result is a handoff pseudo-session under
+   * ${XIRP_ANTIGRAVITY_HOME || ~/.xirp-antigravity}/handoff/<sessionId>/, not
+   * a fabricated entry in agy's own brain/. See writeHandoffSession.
+   */
   async writeNative(messages, dir, cwd, sessionId) {
-    return writeSessionFiles(dir, cwd, sessionId, messages);
+    return writeHandoffSession(messages, cwd, sessionId);
   },
 
   async writeNoticeSeed(dir, cwd, sessionId, text) {
     const timestamp = new Date().toISOString();
-    return writeSessionFiles(dir, cwd, sessionId, [
-      { type: "user_message", text, timestamp },
-    ]);
+    return writeHandoffSession([{ type: "user_message", text, timestamp }], cwd, sessionId);
   },
 
+  /**
+   * Forking copies the source transcript into a fresh handoff pseudo-session.
+   * A real agy conversation cannot be cloned on disk, so the fork resumes the
+   * same way a handoff does: by reading the rendered transcript.
+   */
+  async forkNative(srcPath, newSessionId, cwd, destDir) {
+    const messages = await this.readNative(srcPath);
+    return writeHandoffSession(messages, cwd, newSessionId);
+  },
+
+  /**
+   * A real conversation resumes by id. A handoff has no id agy knows about, so
+   * it resumes as an initial prompt that points at the rendered transcript
+   * (`-i` runs the prompt once and then stays interactive).
+   */
   resumeArgs(sessionFilePath) {
-    return ["--resume", sessionIdFromPath(sessionFilePath)];
+    const id = conversationIdFromPath(sessionFilePath);
+    if (isHandoffTranscriptPath(sessionFilePath)) {
+      return ["-i", handoffPrompt(handoffMarkdownFile(id))];
+    }
+    return ["--conversation", id];
   },
 
   formatResumeCommand(sessionFilePath, binary) {
-    const bin = binary || "grok";
-    return `${bin} --resume ${sessionIdFromPath(sessionFilePath)}`;
+    const bin = binary || "agy";
+    const id = conversationIdFromPath(sessionFilePath);
+    if (isHandoffTranscriptPath(sessionFilePath)) {
+      return `${bin} -i ${JSON.stringify(handoffPrompt(handoffMarkdownFile(id)))}`;
+    }
+    return `${bin} --conversation ${id}`;
   },
 
-  freshLaunchArgs(sessionId, argv) {
-    const args = Array.isArray(argv) ? argv : [];
-    const conflicts = args.some(
-      (arg) =>
-        RESUME_CONFLICT_FLAGS.has(arg) ||
-        arg.startsWith("--session-id=") ||
-        arg.startsWith("--resume=") ||
-        arg.startsWith("--fork-session="),
-    );
-    // Grok's --session-id must be a UUID; squab ids are crypto.randomUUID()
-    // in practice, but if a caller hands us something else, fall back to
-    // squab's recency discovery instead of making grok reject the launch.
-    if (conflicts || !UUID_RE.test(String(sessionId))) return [];
-    return ["--session-id", sessionId];
+  /**
+   * agy has no flag or environment variable that presets the conversation id
+   * of a fresh launch (`--conversation` only *resumes* an existing one, and
+   * ANTIGRAVITY_CONVERSATION_ID is not read on startup). squab therefore falls
+   * back to recency discovery through locateLatest once the CLI has written
+   * its cwd -> conversation mapping.
+   */
+  freshLaunchArgs() {
+    return [];
   },
 
   terminateKeystrokes() {
-    // Verified against grok 1.0.30 through a pty: double Ctrl-C and ctrl+q do
-    // not quit the TUI, "/exit" does. Ctrl-C first cancels any running turn
-    // so the slash command lands on an idle prompt.
-    return [{ bytes: "\x03" }, { bytes: "/exit\r", afterMs: 150 }];
+    // Verified against agy 1.2.0 through a pty, from a rendered TUI: a single
+    // Ctrl-C does not quit (it cancels the running turn, or arms the prompt
+    // "press ctrl+c again to exit"); a second Ctrl-C within the arm window
+    // does quit. "/exit", "/quit" and Ctrl-D Ctrl-D also quit, but they depend
+    // on the composer being empty and on the slash-command menu's selection,
+    // so the Ctrl-C path is the robust one. Sending one Ctrl-C first cancels
+    // any running turn (and clears typed text), then the pair quits; when the
+    // CLI is already idle the first Ctrl-C merely arms the exit and the pair's
+    // first byte completes it, with the trailing byte landing on a dead pty.
+    // Confirmed to quit both from an idle prompt and with text in the composer.
+    return [{ bytes: "\x03" }, { bytes: "\x03\x03", afterMs: 150 }];
   },
 
   sanitize(messages) {
     return messages;
-  },
-
-  async forkNative(srcPath, newSessionId, cwd, destDir) {
-    const srcDir = sessionDirOf(srcPath);
-    const oldSessionId = sessionIdFromPath(srcPath);
-    const destSessionDir = sessionDirFor(destDir, newSessionId);
-    await fsp.mkdir(destDir, { recursive: true, mode: DIR_MODE });
-    await fsp.cp(srcDir, destSessionDir, { recursive: true });
-    await ensureCwdMarker(destDir, cwd);
-
-    const summaryPath = summaryFileIn(destSessionDir);
-    const summary = await readJsonOrNull(summaryPath);
-    if (summary) {
-      if (!isPlainObject(summary.info)) summary.info = {};
-      summary.info.id = newSessionId;
-      summary.info.cwd = cwd;
-      await fsp.writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, {
-        mode: FILE_MODE,
-      });
-    }
-
-    const updatesPath = updatesFileIn(destSessionDir);
-    const updatesText = await readTextOrNull(updatesPath);
-    if (updatesText !== null) {
-      const rewritten = updatesText
-        .split("\n")
-        .map((line) => {
-          const trimmed = line.trim();
-          if (!trimmed) return line;
-          let record;
-          try {
-            record = JSON.parse(trimmed);
-          } catch {
-            return line;
-          }
-          if (!isPlainObject(record) || !isPlainObject(record.params)) return line;
-          if (typeof record.params.sessionId === "string") {
-            record.params.sessionId = newSessionId;
-          }
-          const meta = record.params._meta;
-          if (isPlainObject(meta) && typeof meta.eventId === "string") {
-            if (oldSessionId && meta.eventId.startsWith(`${oldSessionId}-`)) {
-              meta.eventId = newSessionId + meta.eventId.slice(oldSessionId.length);
-            }
-          }
-          return JSON.stringify(record);
-        })
-        .join("\n");
-      await fsp.writeFile(updatesPath, rewritten, { mode: FILE_MODE });
-    }
-
-    return sessionFileIn(destSessionDir);
   },
 
   async parseSessionFile(sessionFilePath, opts) {
@@ -422,33 +472,29 @@ const grokAdapter = {
     }
 
     const text = (await readTextOrNull(sessionFilePath)) ?? "";
-    const summary = await readSummaryFor(sessionFilePath);
-    const info = summaryInfo(summary);
-    const timeline = await timelineFor(sessionFilePath);
-    const { messages } = historyToMessages(text, {
-      timeline,
-      baseTime: asString(summary?.created_at) || EPOCH_ZERO,
-    });
+    const { messages } = transcriptToMessages(text, { baseTime: EPOCH_ZERO });
     const parsedMessages = toParsedMessages(messages);
 
-    const totalUsage = emptyUsage();
-    for (const turn of timeline.usageTurns) addUsage(totalUsage, turn);
-    const latestUsage =
-      timeline.usageTurns.length > 0 ? timeline.usageTurns[timeline.usageTurns.length - 1] : null;
-
-    let model = asString(summary?.current_model_id) || null;
-    if (!model) {
-      for (const entry of inspectHistory(text).entries) {
-        if (entry.type === "assistant" && asString(entry.model_id)) model = asString(entry.model_id);
-      }
-    }
-
-    const sessionId =
-      asString(info?.id) || sessionIdFromPath(sessionFilePath) || timeline.sessionId || "";
+    const sessionId = conversationIdFromPath(sessionFilePath);
     if (!sessionId) {
       throw new Error(
-        `grokAdapter.parseSessionFile: ${sessionFilePath} has no extractable sessionId`,
+        `antigravityAdapter.parseSessionFile: ${sessionFilePath} has no extractable sessionId`,
       );
+    }
+
+    const isHandoff = isHandoffTranscriptPath(sessionFilePath);
+
+    // agy records the active model in its global settings, not per session.
+    const settings = await readJsonOrNull(settingsFile());
+    const model = asString(settings?.model) || null;
+
+    let summary = null;
+    if (!isHandoff) {
+      for (const entry of await readCliConversationSummaries()) {
+        if (entry.id !== sessionId) continue;
+        summary = asString(entry.summary.Title) || asString(entry.summary.Preview) || null;
+        break;
+      }
     }
 
     let lastUserMessage = null;
@@ -458,54 +504,52 @@ const grokAdapter = {
       }
     }
 
-    const sessionDir = sessionDirOf(sessionFilePath);
-    const sessionSummary =
-      asString(summary?.session_summary) ||
-      asString(summary?.generated_title) ||
-      asString(summary?.last_turn_summary) ||
-      null;
-
     return {
       schema: PARSED_SCHEMA,
       sessionId,
       agent: AGENT,
       model,
-      metadataWatchPaths: [summaryFileIn(sessionDir), updatesFileIn(sessionDir)],
-      summary: sessionSummary,
+      metadataWatchPaths: isHandoff
+        ? [handoffSessionFile(sessionId)]
+        : [lastConversationsFile(), metadataFile(), settingsFile()],
+      summary,
       lastUserMessage,
       messageCount: parsedMessages.length,
-      totalUsage,
-      latestUsage,
+      // agy's transcript steps carry no token accounting of any kind, and the
+      // print-mode usage block is never written to the transcript, so squab
+      // gets zeroes rather than a guess.
+      totalUsage: emptyUsage(),
+      latestUsage: null,
       contextWindowSize: null,
       messages: applyParseOpts(parsedMessages, options),
     };
   },
 
   settingsCatalog: {
-    lastUpdated: "2026-09-12",
+    lastUpdated: "2026-09-13",
     list: () => settingsCatalogItems.map((item) => ({ ...item })),
   },
 
-  hookCapabilities: grokHookCapabilities,
-  hookScript: grokHookScript,
-  hookInstallEntry: grokHookInstallEntry,
+  hookCapabilities: antigravityHookCapabilities,
+  hookScript: antigravityHookScript,
+  hookInstallEntry: antigravityHookInstallEntry,
 };
 
-const grokHarnessDef = {
-  flag: "--launch-grok",
-  cmd: "launch-grok",
+const antigravityHarnessDef = {
+  flag: "--launch-antigravity",
+  cmd: "launch-antigravity",
   agentName: AGENT,
-  binary: "grok",
-  installHint: "Install Grok Build: curl -fsSL https://x.ai/cli/install.sh | bash",
-  description: "Hand the terminal over to xAI's `grok` CLI (Grok Build).",
+  binary: "agy",
+  installHint:
+    "Install the Antigravity CLI: see https://antigravity.google (then run: agy install)",
+  description: "Hand the terminal over to Google's `agy` CLI (Antigravity).",
   visibility: "public",
   lifecycle: {
-    install: {
-      kind: "vendor-script",
-      url: "https://x.ai/cli/install.sh",
-      interpreter: ["bash"],
-      binDir: "~/.grok/bin",
-    },
+    // agy ships as a standalone Go binary at ~/.local/bin/agy. Google
+    // publishes no vendor install script URL (the binary references only
+    // documentation pages and its own auto-update endpoint), so there is
+    // nothing honest for squab to run on the user's behalf.
+    install: { kind: "none" },
     update: { kind: "self-update", args: ["update"] },
     uninstall: { kind: "none" },
   },
@@ -515,9 +559,18 @@ const grokHarnessDef = {
  * Entry point squab's patched bundle calls: registers the harness definition
  * first, then the session adapter.
  */
-function registerGrok(registerAdapter, registerHarness) {
-  registerHarness(grokHarnessDef);
-  registerAdapter(grokAdapter);
+function registerAntigravity(registerAdapter, registerHarness) {
+  registerHarness(antigravityHarnessDef);
+  registerAdapter(antigravityAdapter);
 }
 
-export { AGENT, SESSION_FILE, grokAdapter, grokHarnessDef, registerGrok, settingsCatalogItems };
+export {
+  AGENT,
+  TRANSCRIPT_FILE,
+  agyHome,
+  handoffRoot,
+  antigravityAdapter,
+  antigravityHarnessDef,
+  registerAntigravity,
+  settingsCatalogItems,
+};

@@ -2,222 +2,304 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  buildTimeline,
-  historyToMessages,
-  inspectHistory,
-  mapTurnUsage,
-  messagesToHistory,
+  EPOCH_ZERO,
+  MAX_TEXT_BYTES,
+  extractUserRequest,
+  toolNameFromStepType,
+  synthesizeToolUseId,
+  parseJsonl,
+  inspectTranscript,
+  transcriptToMessages,
+  messagesToTranscript,
+  messagesToMarkdown,
   toParsedMessages,
+  applyParseOpts,
+  truncateText,
+  emptyUsage,
+  addUsage,
 } from "../src/harness/transcript.js";
-import { readFixture } from "./helpers.js";
+import { PROBE_ID, RICH_ID, readFixtureTranscript } from "./fixtures/agy-home.js";
 
-const CREATED_AT = "2026-09-10T12:00:00.000Z";
+test("extractUserRequest keeps only the USER_REQUEST body", () => {
+  const content =
+    "<USER_REQUEST>\nreply with exactly the word OK\n</USER_REQUEST>\n" +
+    "<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-13T10:21:02-06:00.\n</ADDITIONAL_METADATA>\n" +
+    "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection`.\n</USER_SETTINGS_CHANGE>";
+  assert.equal(extractUserRequest(content), "reply with exactly the word OK");
 
-async function basicMessages() {
-  const history = await readFixture("session-basic", "chat_history.jsonl");
-  const updates = await readFixture("session-basic", "updates.jsonl");
-  return historyToMessages(history, { timeline: buildTimeline(updates), baseTime: CREATED_AT });
-}
-
-test("every chat_history line type maps to the right canonical message", async () => {
-  const { messages } = await basicMessages();
-  assert.deepEqual(messages, [
-    {
-      type: "user_message",
-      text: "Explain the build script.",
-      timestamp: "2026-09-10T12:00:00.000Z",
-    },
-    {
-      type: "assistant_message",
-      text: "Reading it now.",
-      timestamp: "2026-09-10T12:00:01.000Z",
-    },
-    {
-      type: "tool_use",
-      id: "call-aaaa-1",
-      tool: "read_file",
-      input: { target_file: "scripts/build.js" },
-      timestamp: "2026-09-10T12:00:01.000Z",
-    },
-    {
-      type: "tool_result",
-      toolUseId: "call-aaaa-1",
-      output: "console.log('hi')",
-      timestamp: "2026-09-10T12:00:01.000Z",
-    },
-    {
-      type: "system_note",
-      text: "Grok ran web_search: grok cli docs",
-      timestamp: "2026-09-10T12:00:01.000Z",
-    },
-    {
-      type: "assistant_message",
-      text: "It logs a greeting.",
-      timestamp: "2026-09-10T12:00:04.000Z",
-    },
-    { type: "user_message", text: "Thanks.", timestamp: "2026-09-10T12:00:10.000Z" },
-    {
-      type: "tool_use",
-      id: "call-bbbb-1",
-      tool: "list_dir",
-      input: { path: "." },
-      timestamp: "2026-09-10T12:00:11.000Z",
-    },
-    {
-      type: "tool_result",
-      toolUseId: "call-bbbb-1",
-      output: "scripts/",
-      timestamp: "2026-09-10T12:00:11.000Z",
-    },
-  ]);
+  // Without the wrapper, the system-authored blocks are still stripped.
+  assert.equal(
+    extractUserRequest("bare prompt\n<ADDITIONAL_METADATA>\nnoise\n</ADDITIONAL_METADATA>"),
+    "bare prompt",
+  );
+  assert.equal(extractUserRequest(undefined), "");
 });
 
-test("system, reasoning and synthetic user lines are skipped", async () => {
-  const { messages } = await basicMessages();
+test("toolNameFromStepType lowercases the step type and drops the CORTEX prefix", () => {
+  assert.equal(toolNameFromStepType("VIEW_FILE"), "view_file");
+  assert.equal(toolNameFromStepType("CORTEX_STEP_TYPE_RUN_COMMAND"), "run_command");
+  assert.equal(toolNameFromStepType(""), "unknown");
+});
+
+test("synthesizeToolUseId is deterministic per step and call index", () => {
+  assert.equal(synthesizeToolUseId(5, 1), "step-5-call-1");
+  assert.notEqual(synthesizeToolUseId(5, 0), synthesizeToolUseId(5, 1));
+});
+
+test("parseJsonl reports invalid lines instead of throwing", () => {
+  const { rows, warnings } = parseJsonl('{"a":1}\nnot json\n[1,2]\n\n{"b":2}\n');
+  assert.deepEqual(
+    rows.map((row) => row.value),
+    [{ a: 1 }, { b: 2 }],
+  );
+  assert.deepEqual(warnings, [
+    { line: 2, reason: "invalid-json" },
+    { line: 3, reason: "not-an-object" },
+  ]);
+  assert.deepEqual(parseJsonl(""), { rows: [], warnings: [] });
+});
+
+test("inspectTranscript counts every step type it sees", async () => {
+  const text = await readFixtureTranscript(PROBE_ID);
+  const { counts, steps } = inspectTranscript(text);
+  assert.equal(steps.length, 11);
+  assert.deepEqual(counts, { USER_INPUT: 1, PLANNER_RESPONSE: 5, ERROR_MESSAGE: 5 });
+});
+
+test("the probe transcript maps to one user message and five error notes", async () => {
+  const text = await readFixtureTranscript(PROBE_ID);
+  const { messages, skipped } = transcriptToMessages(text);
+
+  assert.equal(messages.length, 6);
+  assert.deepEqual(messages[0], {
+    type: "user_message",
+    text: "reply with exactly the word OK",
+    timestamp: "2026-09-13T16:21:02.000Z",
+  });
+  // The five PLANNER_RESPONSE steps carry neither text nor tool calls.
+  assert.equal(skipped, 5);
+  for (const message of messages.slice(1)) {
+    assert.equal(message.type, "system_note");
+    assert.match(message.text, /^Error: The stream was interrupted/);
+  }
+});
+
+test("a rich transcript maps assistant text, tool calls, tool results and errors", async () => {
+  const text = await readFixtureTranscript(RICH_ID);
+  const { messages, skipped } = transcriptToMessages(text);
+
+  assert.deepEqual(
+    messages.map((message) => message.type),
+    [
+      "user_message",
+      "assistant_message",
+      "tool_use",
+      "tool_result",
+      "tool_use",
+      "tool_use",
+      "tool_result",
+      "tool_result",
+      "system_note",
+      "assistant_message",
+    ],
+  );
+
+  // CONVERSATION_HISTORY (no content) and EPHEMERAL_MESSAGE (CLI boilerplate).
+  assert.equal(skipped, 2);
+
+  assert.equal(messages[0].text, "summarise what parser.js does");
+  assert.equal(messages[1].text, "I will read parser.js first.");
+
+  const viewCall = messages[2];
+  assert.equal(viewCall.tool, "view_file");
+  assert.equal(viewCall.id, "step-2-call-0");
+  assert.equal(viewCall.input.AbsolutePath, "/fixture/rich-repo/parser.js");
+
+  // VIEW_FILE's derived tool name matches the pending view_file call.
+  assert.equal(messages[3].toolUseId, "step-2-call-0");
+  assert.match(messages[3].output, /Total Lines: 3/);
+
+  // The second PLANNER_RESPONSE has empty content, so it yields no assistant
+  // message -- only its two tool calls.
+  assert.equal(messages[4].tool, "run_command");
+  assert.equal(messages[4].id, "step-5-call-0");
+  assert.equal(messages[5].tool, "list_dir");
+  assert.equal(messages[5].id, "step-5-call-1");
+
+  // RUN_COMMAND matches run_command by name; LIST_DIRECTORY does not match
+  // "list_dir", so it falls back to the oldest unmatched call.
+  assert.equal(messages[6].toolUseId, "step-5-call-0");
+  assert.equal(messages[7].toolUseId, "step-5-call-1");
+
+  // ERROR_MESSAGE prefers the structured `error` field over `content`.
+  assert.equal(messages[8].type, "system_note");
+  assert.equal(messages[8].text, "There was a problem parsing the tool call.");
+
+  assert.equal(messages[9].text, "`parser.js` exports a single `parse` function that wraps `JSON.parse`.");
+
+  // `thinking` is the model's private reasoning and is never surfaced.
   assert.equal(
-    messages.some((m) => m.text && m.text.includes("<system_note>")),
+    messages.some((message) => String(message.text ?? "").includes("Planning the read")),
     false,
   );
-  assert.equal(
-    messages.some((m) => m.text && m.text.includes("Look at the file first.")),
-    false,
-  );
 });
 
-test("inspectHistory counts unknown line types as warnings", async () => {
-  const history = await readFixture("session-basic", "chat_history.jsonl");
-  const { entries, warnings, counts } = inspectHistory(history);
-  assert.equal(entries.length, 11);
-  assert.deepEqual(warnings, [{ line: 12, reason: "unknown-type", type: "future_line_type" }]);
-  assert.equal(counts.assistant, 3);
-  assert.equal(counts.user, 3);
-  assert.equal(counts.backend_tool_call, 1);
-  assert.equal(counts.future_line_type, 1);
+test("timestamps come from created_at and never move backwards", () => {
+  const text = [
+    '{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-01-02T03:04:05Z","content":"<USER_REQUEST>\\nhi\\n</USER_REQUEST>"}',
+    '{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2020-01-01T00:00:00Z","content":"out of order"}',
+    '{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","content":"no created_at"}',
+  ].join("\n");
+  const { messages } = transcriptToMessages(text, { baseTime: "2026-01-02T03:04:05Z" });
+  assert.equal(messages[0].timestamp, "2026-01-02T03:04:05.000Z");
+  assert.equal(messages[1].timestamp, "2026-01-02T03:04:05.000Z", "clamped forward");
+  // No created_at at all: baseTime offset by the step's position in the file.
+  assert.equal(messages[2].timestamp, "2026-01-02T03:04:05.002Z");
 });
 
-test("malformed JSONL lines are reported, not thrown", () => {
-  const text = '{"type":"user","content":[{"type":"text","text":"hi"}],"prompt_index":0}\nnot json\n42\n';
-  const { entries, warnings } = inspectHistory(text);
-  assert.equal(entries.length, 1);
-  assert.deepEqual(warnings.map((w) => w.reason).sort(), ["invalid-json", "not-an-object"]);
+test("transcriptToMessages tolerates empty and unparseable input", () => {
+  assert.deepEqual(transcriptToMessages("").messages, []);
+  const { messages, warnings } = transcriptToMessages("not json\n");
+  assert.deepEqual(messages, []);
+  assert.deepEqual(warnings, [{ line: 1, reason: "invalid-json" }]);
 });
 
-test("tool_call arguments that are not JSON fall back to a raw wrapper", () => {
-  const text = JSON.stringify({
-    type: "assistant",
-    content: "",
-    tool_calls: [{ id: "call-x-1", name: "run", arguments: "{oops" }],
-  });
-  const { messages } = historyToMessages(text, { baseTime: CREATED_AT });
-  assert.deepEqual(messages[0].input, { raw: "{oops" });
-});
+test("messagesToTranscript round-trips canonical messages through agy's step shape", async () => {
+  const original = transcriptToMessages(await readFixtureTranscript(RICH_ID)).messages;
+  const steps = messagesToTranscript(original);
+  const jsonl = steps.map((step) => JSON.stringify(step)).join("\n");
+  const roundTripped = transcriptToMessages(jsonl).messages;
 
-test("timestamps fall back to created_at plus index when updates are missing", async () => {
-  const history = await readFixture("session-basic", "chat_history.jsonl");
-  const { messages } = historyToMessages(history, { baseTime: CREATED_AT });
-  const stamps = messages.map((m) => m.timestamp);
-  assert.deepEqual(stamps, [...stamps].sort(), "timestamps are monotonic");
-  assert.equal(stamps[0], "2026-09-10T12:00:00.001Z");
-  assert.equal(stamps.at(-1), "2026-09-10T12:00:00.009Z");
-});
-
-test("buildTimeline collapses streaming chunks and reads usage", async () => {
-  const updates = await readFixture("session-basic", "updates.jsonl");
-  const timeline = buildTimeline(updates);
-  assert.equal(timeline.sessionId, "11111111-2222-4333-8444-555555555555");
-  assert.deepEqual([...timeline.userTs.entries()], [
-    [0, 1789041600000],
-    [1, 1789041610000],
-  ]);
-  assert.deepEqual(timeline.agentTs, [
-    1789041601000, 1789041602000, 1789041604000, 1789041611000,
-  ]);
-  assert.equal(timeline.usageTurns.length, 2);
-});
-
-test("buildTimeline falls back to the unix-seconds timestamp field", () => {
-  const line = JSON.stringify({
-    timestamp: 1789041600,
-    method: "session/update",
-    params: {
-      sessionId: "s1",
-      update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "hi" } },
-      _meta: { eventId: "s1-1", promptIndex: 0 },
-    },
-  });
-  assert.equal(buildTimeline(line).userTs.get(0), 1789041600000);
-});
-
-test("mapTurnUsage renames Grok's cache fields and drops empty turns", () => {
   assert.deepEqual(
-    mapTurnUsage({ inputTokens: 10, outputTokens: 2, cachedReadTokens: 3, cacheCreationTokens: 4 }),
-    {
-      inputTokens: 10,
-      outputTokens: 2,
-      cacheReadTokens: 3,
-      cacheWriteTokens: 4,
-      cacheWrite5mTokens: 0,
-      cacheWrite1hTokens: 0,
-    },
+    roundTripped.map((message) => message.type),
+    original.map((message) => message.type),
   );
-  assert.equal(mapTurnUsage({ inputTokens: 0, outputTokens: 0 }), null);
-  assert.equal(mapTurnUsage(null), null);
+  assert.equal(roundTripped[0].text, original[0].text);
+  assert.equal(roundTripped[1].text, original[1].text);
+  assert.equal(roundTripped[2].tool, "view_file");
+  assert.deepEqual(roundTripped[2].input, original[2].input);
+  assert.equal(roundTripped[3].output, original[3].output);
+  assert.equal(roundTripped[8].text, original[8].text);
+  for (let i = 0; i < original.length; i++) {
+    assert.equal(roundTripped[i].timestamp, original[i].timestamp, `timestamp ${i}`);
+  }
 });
 
-test("messagesToHistory merges an assistant message with its tool calls", () => {
-  const lines = messagesToHistory([
-    { type: "user_message", text: "go" },
-    { type: "assistant_message", text: "working" },
-    { type: "tool_use", id: "call-1", tool: "read_file", input: { p: "a" } },
-    { type: "tool_result", toolUseId: "call-1", output: "ok" },
-    { type: "system_note", text: "note" },
-    { type: "handoff_marker" },
-    { type: "image", mimeType: "image/png" },
-    { type: "user_message", text: "next" },
+test("messagesToTranscript writes step_index, status and agy's own source/type names", () => {
+  const steps = messagesToTranscript([
+    { type: "user_message", text: "hello", timestamp: "2026-02-01T00:00:00.000Z" },
+    { type: "assistant_message", text: "hi", timestamp: "2026-02-01T00:00:01.000Z" },
+    { type: "tool_use", id: "x", tool: "view_file", input: { p: 1 }, timestamp: "2026-02-01T00:00:01.000Z" },
+    { type: "tool_result", toolUseId: "x", output: "done", timestamp: "2026-02-01T00:00:02.000Z" },
+    { type: "system_note", text: "note", timestamp: "2026-02-01T00:00:03.000Z" },
+    { type: "handoff_marker", timestamp: "2026-02-01T00:00:04.000Z" },
   ]);
+
   assert.deepEqual(
-    lines.map((l) => l.type),
-    ["user", "assistant", "tool_result", "user", "user"],
+    steps.map((step) => [step.step_index, step.source, step.type]),
+    [
+      [0, "USER_EXPLICIT", "USER_INPUT"],
+      [1, "MODEL", "PLANNER_RESPONSE"],
+      [2, "MODEL", "GENERIC"],
+      [3, "SYSTEM", "SYSTEM_MESSAGE"],
+    ],
   );
-  assert.equal(lines[0].prompt_index, 0);
-  assert.equal(lines[1].content, "working");
-  assert.deepEqual(lines[1].tool_calls, [
-    { id: "call-1", name: "read_file", arguments: '{"p":"a"}' },
-  ]);
-  assert.equal(lines[3].synthetic_reason, "xirp_handoff");
-  assert.equal(lines[3].content[0].text, "<system_note>note</system_note>");
-  assert.equal(lines[4].prompt_index, 1, "synthetic turns do not consume a prompt index");
+  assert.ok(steps.every((step) => step.status === "DONE"));
+  assert.equal(steps[0].content, "<USER_REQUEST>\nhello\n</USER_REQUEST>");
+  // The assistant message and the tool call collapse into one PLANNER_RESPONSE.
+  assert.equal(steps[1].content, "hi");
+  assert.deepEqual(steps[1].tool_calls, [{ name: "view_file", args: { p: 1 } }]);
 });
 
-test("toParsedMessages produces squab's flattened row shape", async () => {
-  const { messages } = await basicMessages();
-  const rows = toParsedMessages(messages);
-  assert.equal(rows.length, messages.length);
-  assert.deepEqual(rows[0], {
-    id: null,
-    ts: "2026-09-10T12:00:00.000Z",
-    role: "user",
-    type: "message",
-    text: "Explain the build script.",
-  });
-  assert.deepEqual(rows[2], {
-    id: "call-aaaa-1",
-    ts: "2026-09-10T12:00:01.000Z",
-    role: "assistant",
-    type: "tool_use",
-    text: 'read_file({"target_file":"scripts/build.js"})',
-    toolName: "read_file",
-    toolInput: { target_file: "scripts/build.js" },
-  });
-  assert.equal(rows[3].role, "tool");
+test("messagesToMarkdown renders a transcript an agent can read", async () => {
+  const messages = transcriptToMessages(await readFixtureTranscript(RICH_ID)).messages;
+  const markdown = messagesToMarkdown(messages, { cwd: "/fixture/rich-repo" });
+
+  assert.match(markdown, /^# Handed-off conversation/);
+  assert.match(markdown, /Working directory: `\/fixture\/rich-repo`/);
+  assert.match(markdown, /## User — 2026-09-12T10:00:00\.000Z/);
+  assert.match(markdown, /summarise what parser\.js does/);
+  assert.match(markdown, /### Tool call: `view_file`/);
+  assert.match(markdown, /> \*\*System:\*\* There was a problem parsing the tool call\./);
+  assert.equal(markdown.endsWith("\n"), true);
+});
+
+test("toParsedMessages flattens canonical messages into squab's row shape", () => {
+  const rows = toParsedMessages([
+    { type: "user_message", text: "hi", timestamp: "2026-02-01T00:00:00.000Z" },
+    { type: "assistant_message", text: "yo", timestamp: "2026-02-01T00:00:01.000Z" },
+    { type: "tool_use", id: "t1", tool: "view_file", input: { a: 1 }, timestamp: "2026-02-01T00:00:02.000Z" },
+    { type: "tool_result", toolUseId: "t1", output: "ok", timestamp: "2026-02-01T00:00:03.000Z" },
+    { type: "tool_result", toolUseId: "t2", output: "bad", error: "boom", timestamp: "2026-02-01T00:00:04.000Z" },
+    { type: "system_note", text: "note", timestamp: "2026-02-01T00:00:05.000Z" },
+    { type: "unknown_kind", timestamp: "2026-02-01T00:00:06.000Z" },
+  ]);
+
+  assert.deepEqual(
+    rows.map((row) => [row.role, row.type]),
+    [
+      ["user", "message"],
+      ["assistant", "message"],
+      ["assistant", "tool_use"],
+      ["tool", "tool_result"],
+      ["tool", "tool_result"],
+      ["system", "message"],
+    ],
+  );
+  assert.equal(rows[2].toolName, "view_file");
+  assert.deepEqual(rows[2].toolInput, { a: 1 });
+  assert.equal(rows[2].text, 'view_file({"a":1})');
   assert.equal(rows[3].toolError, false);
-  assert.equal(rows[4].role, "system");
+  assert.equal(rows[4].toolError, true);
+  assert.equal(rows[0].id, null);
 });
 
-test("historyToMessages unwraps Grok's <user_query> wrapper around typed prompts", async () => {
-  const { historyToMessages } = await import("../src/harness/transcript.js");
-  const line = JSON.stringify({ type: "user", content: [{ type: "text", text: "<user_query>\nfix the bug\n</user_query>" }], prompt_index: 0 });
-  const { messages } = historyToMessages(line, { baseTime: "2026-01-01T00:00:00.000Z" });
-  const user = messages.find((m) => m.type === "user_message");
-  assert.equal(user.text, "fix the bug");
+test("applyParseOpts honours since, limit and summaryOnly", () => {
+  const rows = [
+    { ts: "2026-01-01T00:00:00.000Z" },
+    { ts: "2026-01-02T00:00:00.000Z" },
+    { ts: "2026-01-03T00:00:00.000Z" },
+  ];
+  assert.equal(applyParseOpts(rows, undefined), rows);
+  assert.deepEqual(applyParseOpts(rows, { summaryOnly: true }), []);
+  assert.equal(applyParseOpts(rows, { since: "2026-01-01T12:00:00.000Z" }).length, 2);
+  assert.equal(applyParseOpts(rows, { limit: 1 }).length, 1);
+  assert.equal(applyParseOpts(rows, { limit: 0 }).length, 0);
+});
+
+test("truncateText is byte-bounded and never splits a surrogate pair", () => {
+  assert.equal(truncateText("short"), "short");
+  assert.equal(truncateText(undefined), "");
+
+  const long = "a".repeat(MAX_TEXT_BYTES + 100);
+  const cut = truncateText(long);
+  assert.ok(Buffer.byteLength(cut) <= MAX_TEXT_BYTES);
+  assert.match(cut, /\[truncated\]$/);
+
+  // "😀" is a surrogate pair; slicing at an odd boundary must not split it.
+  const emoji = "😀".repeat(20);
+  const tight = truncateText(emoji, 30);
+  assert.ok(Buffer.byteLength(tight) <= 30);
+  assert.equal(tight.includes("�"), false);
+  assert.equal(JSON.parse(JSON.stringify(tight)), tight);
+});
+
+test("usage is all zeroes, because agy's transcript carries no token counts", () => {
+  const usage = emptyUsage();
+  assert.deepEqual(usage, {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cacheWrite5mTokens: 0,
+    cacheWrite1hTokens: 0,
+  });
+  addUsage(usage, { inputTokens: 3, outputTokens: 4 });
+  assert.equal(usage.inputTokens, 3);
+  assert.equal(usage.outputTokens, 4);
+  assert.equal(addUsage(usage, null), usage);
+});
+
+test("EPOCH_ZERO is the fallback clock", () => {
+  assert.equal(EPOCH_ZERO, "1970-01-01T00:00:00.000Z");
 });

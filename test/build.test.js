@@ -4,13 +4,13 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { pathToFileURL } from "node:url";
-
-import { REPO_ROOT } from "./helpers.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const run = promisify(execFile);
+const here = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(here, "..");
 const BUILD_SCRIPT = path.join(REPO_ROOT, "scripts", "build-harness.js");
-const DIST = path.join(REPO_ROOT, "dist", "grok-harness.js");
+const DIST = path.join(REPO_ROOT, "dist", "antigravity-harness.js");
 const XIRP_NODE = "/Applications/Xirp.app/Contents/Resources/node-runtime/node";
 
 let built = false;
@@ -30,13 +30,18 @@ test("the build produces one import block, one export, and no relative imports",
     'import fsp from "node:fs/promises";',
     'import path from "node:path";',
     'import os from "node:os";',
-    'import crypto from "node:crypto";',
   ]);
-  assert.deepEqual(exportLines, ["export { registerGrok };"]);
+  assert.deepEqual(exportLines, ["export { registerAntigravity };"]);
   assert.equal(source.includes('from "./'), false, "no intra-bundle imports may survive");
   for (const line of importLines) {
     assert.match(line, /"node:(fs|fs\/promises|path|os|crypto)"/);
   }
+});
+
+test("the built harness carries no Grok references", async () => {
+  await ensureBuilt();
+  const source = await fsp.readFile(DIST, "utf-8");
+  assert.equal(/grok/i.test(source), false, "the bundle must not mention grok");
 });
 
 test("node --check accepts the built harness", async () => {
@@ -47,33 +52,36 @@ test("node --check accepts the built harness", async () => {
 test("the built harness registers the expected harness and adapter shapes", async () => {
   await ensureBuilt();
   const module = await import(`${pathToFileURL(DIST).href}?built=${Date.now()}`);
-  assert.equal(typeof module.registerGrok, "function");
+  assert.equal(typeof module.registerAntigravity, "function");
 
   let adapter = null;
   let def = null;
-  const order = [];
-  module.registerGrok(
+  const calls = [];
+  module.registerAntigravity(
     (a) => {
-      order.push("rt");
+      calls.push(["adapter", a.agent]);
       adapter = a;
     },
     (d) => {
-      order.push("ot");
+      calls.push(["harness", d.agentName]);
       def = d;
     },
   );
 
-  assert.deepEqual(order, ["ot", "rt"]);
-  assert.equal(def.agentName, "grok");
-  assert.equal(def.flag, "--launch-grok");
-  assert.equal(def.cmd, "launch-grok");
-  assert.equal(def.binary, "grok");
+  assert.deepEqual(calls, [
+    ["harness", "antigravity"],
+    ["adapter", "antigravity"],
+  ]);
+  assert.equal(def.flag, "--launch-antigravity");
+  assert.equal(def.cmd, "launch-antigravity");
+  assert.equal(def.binary, "agy");
   assert.equal(def.visibility, "public");
-  assert.equal(def.lifecycle.install.kind, "vendor-script");
+  assert.equal(def.lifecycle.install.kind, "none");
   assert.equal(def.lifecycle.update.kind, "self-update");
+  assert.deepEqual(def.lifecycle.update.args, ["update"]);
   assert.equal(def.lifecycle.uninstall.kind, "none");
 
-  assert.equal(adapter.agent, "grok");
+  assert.equal(adapter.agent, "antigravity");
   for (const required of [
     "sessionRoot",
     "locateLatest",
@@ -99,13 +107,13 @@ test("the built harness registers the expected harness and adapter shapes", asyn
   }
   assert.equal(typeof adapter.settingsCatalog.list, "function");
 
-  assert.equal(adapter.hookCapabilities.lastUpdated, "2026-09-12");
+  assert.match(adapter.hookCapabilities.lastUpdated, /^\d{4}-\d{2}-\d{2}$/);
   assert.deepEqual(adapter.hookCapabilities.supports, {
     notification: false,
     preToolUse: true,
     postToolUse: true,
     stop: true,
-    sessionStart: true,
+    sessionStart: false,
     permissionRequest: false,
     statusLine: false,
   });
@@ -116,18 +124,19 @@ test("the built harness registers the expected harness and adapter shapes", asyn
     daemonUrl: "http://127.0.0.1:9999/hook",
     authToken: "tok",
   });
-  assert.match(script, /hook-script grok preToolUse/);
+  assert.match(script, /hook-script antigravity preToolUse/);
   assert.match(script, /DAEMON_URL = 'http:\/\/127\.0\.0\.1:9999\/hook'/);
   assert.match(script, /AUTH_TOKEN = 'tok'/);
-  assert.match(script, /payload\.sessionId/);
+  assert.match(script, /payload\.conversationId/);
 
   const entry = adapter.hookInstallEntry("preToolUse", "/tmp/hook.js");
-  assert.match(entry.settingsFile, /\.grok[/\\]hooks[/\\]xirp\.json$/);
-  assert.deepEqual(entry.mergePath, ["hooks", "PreToolUse"]);
+  assert.match(entry.settingsFile, /config[/\\]hooks\.json$/);
+  assert.deepEqual(entry.mergePath, ["xirp", "PreToolUse"]);
+  assert.equal(entry.fragment.matcher, "*");
   assert.equal(entry.fragment.hooks[0].command, "/tmp/hook.js");
   assert.equal(entry.mergeOp, "array-append");
 
-  assert.throws(() => adapter.hookScript("notification", { daemonUrl: "http://x" }));
+  assert.throws(() => adapter.hookScript("sessionStart", { daemonUrl: "http://x" }));
   assert.throws(() => adapter.hookInstallEntry("notification", "/tmp/hook.js"));
 });
 
@@ -145,7 +154,7 @@ test("the built harness loads under Xirp's bundled node runtime", async (t) => {
     return;
   }
 
-  const snippet = `import(${JSON.stringify(DIST)}).then(m=>{const s=[];m.registerGrok(a=>s.push(["rt",a.agent]),d=>s.push(["ot",d.agentName]));console.log(JSON.stringify(s))})`;
+  const snippet = `import(${JSON.stringify(DIST)}).then(m=>{const s=[];m.registerAntigravity(a=>s.push(["adapter",a.agent]),d=>s.push(["harness",d.agentName]));console.log(JSON.stringify(s))})`;
   const { stdout } = await run(XIRP_NODE, ["-e", snippet]);
-  assert.equal(stdout.trim(), '[["ot","grok"],["rt","grok"]]');
+  assert.equal(stdout.trim(), '[["harness","antigravity"],["adapter","antigravity"]]');
 });
