@@ -539,9 +539,9 @@ const antigravityHarnessDef = {
   flag: "--launch-antigravity",
   cmd: "launch-antigravity",
   agentName: AGENT,
-  binary: "agy",
+  binary: "agy-xirp",
   installHint:
-    "Install the Antigravity CLI: see https://antigravity.google (then run: agy install)",
+    "Install the Antigravity CLI (agy) from https://antigravity.google, then run `xirp-antigravity apply` (installs the agy-xirp launch wrapper)",
   description: "Hand the terminal over to Google's `agy` CLI (Antigravity).",
   visibility: "public",
   lifecycle: {

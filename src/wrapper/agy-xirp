@@ -1,0 +1,249 @@
+#!/bin/bash
+# agy-xirp: rewrites Xirp's trailing positional "goal" argument into agy's
+# `-i <text>` flag, then execs the real Antigravity CLI (agy).
+#
+# Why this exists: Xirp's squab daemon builds every coding agent's launch
+# command line by appending the session's initial prompt as a bare trailing
+# positional argument (e.g. `agy --launch-antigravity --session-id <id>
+# 'do the thing'`). That argv-building code lives inside squab's
+# integrity-checked app.asar and cannot be patched. agy (the Go binary,
+# built on the standard `flag` package) rejects positional arguments
+# outright: "Error: unexpected argument ... Prompts are read only from
+# -p/--print, -i/--prompt-interactive, or stdin" and exits 2 -- which is why,
+# from Xirp, launching Antigravity flashes a terminal and closes it.
+#
+# This script is installed as `agy-xirp` next to the real `agy` on PATH, and
+# xirp-antigravity's harness definition points squab at `agy-xirp` instead of
+# `agy` directly. It walks argv, and if it finds a trailing positional, turns
+# it into `-i "<text>"` (or appends it to an already-present -i/
+# --prompt-interactive value) before exec'ing the real binary.
+#
+# Must run on the macOS-shipped bash (3.2): no associative arrays, no
+# mapfile, no `set -u` (bash < 4.4 mishandles `"${arr[@]}"` on an empty array
+# under nounset).
+
+# --- locate the real agy ----------------------------------------------------
+
+# Resolve a path to its final, symlink-free form using only bash builtins and
+# `readlink`/`pwd` (no `readlink -f` or `realpath`, neither guaranteed present
+# on stock macOS).
+resolve_path() {
+  local target="$1"
+  local dir
+  while [ -L "$target" ]; do
+    dir=$(cd "$(dirname "$target")" && pwd)
+    target=$(readlink "$target")
+    case "$target" in
+      /*) : ;;
+      *) target="$dir/$target" ;;
+    esac
+  done
+  dir=$(cd "$(dirname "$target")" 2>/dev/null && pwd)
+  if [ -z "$dir" ]; then
+    printf '%s\n' "$target"
+    return
+  fi
+  printf '%s/%s\n' "$dir" "$(basename "$target")"
+}
+
+# This script's own fully-resolved path, so it can recognize (and skip)
+# itself while walking PATH for "agy".
+self_path() {
+  local p="$0"
+  case "$p" in
+    */*) : ;;
+    *)
+      local d
+      local oldifs="$IFS"
+      IFS=:
+      for d in $PATH; do
+        if [ -x "$d/$p" ]; then
+          p="$d/$p"
+          break
+        fi
+      done
+      IFS="$oldifs"
+      ;;
+  esac
+  resolve_path "$p"
+}
+
+find_real_agy() {
+  if [ -n "$AGY_XIRP_REAL" ]; then
+    printf '%s\n' "$AGY_XIRP_REAL"
+    return 0
+  fi
+
+  local self
+  self=$(self_path)
+
+  local d
+  local oldifs="$IFS"
+  IFS=:
+  for d in $PATH; do
+    local candidate="$d/agy"
+    if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+      local resolved
+      resolved=$(resolve_path "$candidate")
+      if [ "$resolved" != "$self" ]; then
+        IFS="$oldifs"
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+  IFS="$oldifs"
+
+  if [ -x "$HOME/.local/bin/agy" ]; then
+    printf '%s\n' "$HOME/.local/bin/agy"
+    return 0
+  fi
+
+  return 1
+}
+
+REAL=$(find_real_agy) || {
+  printf 'agy-xirp: agy not found on PATH\n' >&2
+  exit 127
+}
+
+# --- subcommands and no-args: pass straight through -------------------------
+#
+# agy's subcommands (agent, agents, changelog, help, install, mcp, models,
+# plugin, plugins, remote-control, update, mic-serve) take their own
+# arbitrary trailing args; never touch argv when one is in play.
+
+if [ $# -eq 0 ]; then
+  exec "$REAL"
+fi
+
+case "$1" in
+  agent|agents|changelog|help|install|mcp|models|plugin|plugins|remote-control|update|mic-serve)
+    exec "$REAL" "$@"
+    ;;
+esac
+
+# --- classify agy's value-taking / boolean flags ----------------------------
+#
+# agy is a Go `flag`-package binary: both `-flag value`/`-flag=value` and
+# `--flag value`/`--flag=value` spellings are accepted for every flag.
+
+is_value_flag() {
+  case "$1" in
+    add-dir|agent|conversation|effort|input-format|json-schema|log-file|mode|model|output-format|print|p|prompt|print-timeout|project|prompt-interactive|i)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+# Name of a flag token (any leading "-"/"--" and any "=value" suffix
+# stripped), e.g. "--model=foo" -> "model", "-i" -> "i".
+flag_name() {
+  local n="${1#-}"
+  n="${n#-}"
+  n="${n%%=*}"
+  printf '%s' "$n"
+}
+
+# --- walk argv ---------------------------------------------------------------
+
+args=("$@")
+n=$#
+new_args=()
+positionals=()
+
+expect_value_for=""   # name of the value-taking flag awaiting its value, or ""
+pending_special=""     # "i" when the value about to be consumed belongs to -i/--prompt-interactive
+i_value_index=-1       # index in new_args holding -i/--prompt-interactive's value (or the whole "flag=value" token)
+i_value_inline=0       # 1 if new_args[i_value_index] is a "flag=value" token
+
+for ((idx = 0; idx < n; idx++)); do
+  arg="${args[$idx]}"
+
+  if [ -n "$expect_value_for" ]; then
+    new_args+=("$arg")
+    if [ "$pending_special" = "i" ]; then
+      i_value_index=$((${#new_args[@]} - 1))
+      i_value_inline=0
+      pending_special=""
+    fi
+    expect_value_for=""
+    continue
+  fi
+
+  case "$arg" in
+    -*)
+      name=$(flag_name "$arg")
+      new_args+=("$arg")
+      case "$arg" in
+        *=*) inline=1 ;;
+        *) inline=0 ;;
+      esac
+      if [ "$name" = "i" ] || [ "$name" = "prompt-interactive" ]; then
+        if [ "$inline" -eq 1 ]; then
+          i_value_index=$((${#new_args[@]} - 1))
+          i_value_inline=1
+        else
+          pending_special="i"
+        fi
+      fi
+      if [ "$inline" -eq 0 ] && is_value_flag "$name"; then
+        expect_value_for="$name"
+      fi
+      ;;
+    *)
+      # A positional that happens to start with "-" arrives prefixed with a
+      # single space by the daemon precisely so it lands here instead of
+      # being misread as a flag; strip that one leading space back off.
+      positionals+=("$arg")
+      ;;
+  esac
+done
+
+# --- fold any positional(s) into -i ------------------------------------------
+
+if [ "${#positionals[@]}" -gt 0 ]; then
+  joined=""
+  first=1
+  for p in "${positionals[@]}"; do
+    case "$p" in
+      " "*) p="${p# }" ;;
+    esac
+    if [ "$first" -eq 1 ]; then
+      joined="$p"
+      first=0
+    else
+      joined="$joined $p"
+    fi
+  done
+
+  if [ "$i_value_index" -ge 0 ]; then
+    existing="${new_args[$i_value_index]}"
+    if [ "$i_value_inline" -eq 1 ]; then
+      flag_part="${existing%%=*}"
+      value_part="${existing#*=}"
+      new_args[$i_value_index]="${flag_part}=${value_part}
+
+${joined}"
+    else
+      new_args[$i_value_index]="${existing}
+
+${joined}"
+    fi
+  else
+    new_args+=("-i" "$joined")
+  fi
+fi
+
+if [ "$AGY_XIRP_DEBUG" = "1" ]; then
+  {
+    printf 'agy-xirp: exec %s' "$REAL"
+    for a in "${new_args[@]}"; do
+      printf ' %q' "$a"
+    done
+    printf '\n'
+  } >&2
+fi
+
+exec "$REAL" "${new_args[@]}"

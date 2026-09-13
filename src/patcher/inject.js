@@ -29,12 +29,15 @@ import {
   existsSync,
   copyFileSync,
   unlinkSync,
+  mkdirSync,
+  chmodSync,
 } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { locate, LocateError } from "./locate.js";
-import { readState, writeState, clearState } from "./state.js";
+import { readState, writeState, clearState, chownToSudoUser } from "./state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -134,6 +137,86 @@ export function resolveHarnessSource({ repoRoot = REPO_ROOT, override } = {}) {
     `No harness module found. Expected a built module at ${distPath} ` +
       `(run \`npm run build\`) or source at ${srcPath}.`,
   );
+}
+
+export const WRAPPER_FILENAME = "agy-xirp";
+
+/**
+ * Resolve the agy-xirp launch wrapper script to install: the repo's
+ * src/wrapper/agy-xirp (or, in tests, an explicit override path). It's a
+ * plain bash script, not built, so there's no dist/ counterpart.
+ */
+export function resolveWrapperSource({ repoRoot = REPO_ROOT, override } = {}) {
+  if (override) {
+    if (!existsSync(override)) {
+      throw new PatchError(`Wrapper override not found at ${override}`);
+    }
+    return override;
+  }
+  const srcPath = path.join(repoRoot, "src", "wrapper", WRAPPER_FILENAME);
+  if (!existsSync(srcPath)) {
+    throw new PatchError(`Wrapper script not found at ${srcPath}`);
+  }
+  return srcPath;
+}
+
+/**
+ * Directory the agy-xirp wrapper should live in: next to whatever `agy` PATH
+ * resolves to right now, so squab's own PATH lookup for `agy-xirp` finds it
+ * in the same place. Falls back to ~/.local/bin (where `agy install` puts
+ * the real binary) when `agy` isn't found on PATH yet.
+ */
+export function resolveAgyDir({ env = process.env, home } = {}) {
+  try {
+    const out = execFileSync("which", ["agy"], { encoding: "utf8", env }).trim();
+    if (out) return { dir: path.dirname(out), agyPath: out, resolved: true };
+  } catch {
+    /* `agy` not on PATH yet — fall through to the default install location */
+  }
+  const fallbackHome = home || env.HOME || os.homedir();
+  return { dir: path.join(fallbackHome, ".local", "bin"), agyPath: null, resolved: false };
+}
+
+/**
+ * Install (or refresh) the agy-xirp launch wrapper. Idempotent: just
+ * re-copies over whatever's there. Returns { wrapperPath, resolved, warning }
+ * — `warning` is set (not thrown) when `agy` couldn't be found on PATH, since
+ * the user may simply not have installed it yet; the wrapper is still
+ * dropped at the fallback location so it's ready once they do.
+ */
+export function installWrapper({
+  repoRoot = REPO_ROOT,
+  env = process.env,
+  home,
+  wrapperOverride,
+} = {}) {
+  const wrapperSource = resolveWrapperSource({ repoRoot, override: wrapperOverride });
+  const { dir, resolved } = resolveAgyDir({ env, home });
+  const warning = resolved
+    ? null
+    : `agy was not found on PATH; installed agy-xirp to ${path.join(dir, WRAPPER_FILENAME)}. ` +
+      `Install the Antigravity CLI (agy) so agy-xirp can find and exec it.`;
+
+  mkdirSync(dir, { recursive: true });
+  const wrapperPath = path.join(dir, WRAPPER_FILENAME);
+  copyFileSync(wrapperSource, wrapperPath);
+  chmodSync(wrapperPath, 0o755);
+  chownToSudoUser(dir);
+  chownToSudoUser(wrapperPath);
+
+  return { wrapperPath, resolved, warning };
+}
+
+/**
+ * Delete the agy-xirp wrapper, if present. No-op if it isn't there (already
+ * removed by hand, or never installed).
+ */
+export function removeWrapper(wrapperPath) {
+  if (wrapperPath && existsSync(wrapperPath)) {
+    unlinkSync(wrapperPath);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -245,6 +328,7 @@ export function apply({
   repoRoot = REPO_ROOT,
   home,
   harnessOverride,
+  wrapperOverride,
 } = {}) {
   const loc = locate({ app, env });
   const { chunk, chunksDir, cliPath, nodePath, version, appPath } = loc;
@@ -254,6 +338,12 @@ export function apply({
   const alreadyPatched = isPatched(chunk.content);
 
   if (alreadyPatched && !force) {
+    // Always (re-)install the wrapper here too: a state marker from before
+    // this feature existed, or a wrapper deleted by hand, shouldn't require
+    // --force to fix.
+    const wrapperResult = installWrapper({ repoRoot, env, home, wrapperOverride });
+    if (wrapperResult.warning) process.stderr.write(`warning: ${wrapperResult.warning}\n`);
+
     const priorState = readState(home);
     writeState(
       {
@@ -269,6 +359,7 @@ export function apply({
         patchVersion: readPatchVersion(repoRoot),
         appliedAt: priorState?.appliedAt ?? new Date().toISOString(),
         origOwnedByUs: priorState?.origOwnedByUs ?? false,
+        wrapperPath: wrapperResult.wrapperPath,
       },
       home,
     );
@@ -278,6 +369,7 @@ export function apply({
       appPath,
       version,
       chunkPath: chunk.path,
+      wrapperPath: wrapperResult.wrapperPath,
     };
   }
 
@@ -319,10 +411,12 @@ export function apply({
 
   const newContent = baseContent + importLine;
 
+  let wrapperResult;
   try {
     copyFileSync(harnessSource, harnessDest);
     writeFileSync(chunk.path, newContent, "utf8");
     verify({ nodePath, cliPath });
+    wrapperResult = installWrapper({ repoRoot, env, home, wrapperOverride });
   } catch (err) {
     // Never leave Xirp in a broken half-patched state: restore the chunk to
     // exactly what it held before this run's edit (which may already carry a
@@ -337,6 +431,7 @@ export function apply({
       code: err.code ?? 1,
     });
   }
+  if (wrapperResult.warning) process.stderr.write(`warning: ${wrapperResult.warning}\n`);
 
   const backupBuffer = readFileSync(backupPath);
   const state = {
@@ -345,6 +440,7 @@ export function apply({
     chunkSha256Original: sha256(backupBuffer),
     chunkSha256Patched: sha256(newContent),
     harnessSha256: sha256(readFileSync(harnessDest, "utf8")),
+    wrapperPath: wrapperResult.wrapperPath,
     patchVersion: readPatchVersion(repoRoot),
     appliedAt: new Date().toISOString(),
     origOwnedByUs,
@@ -374,7 +470,7 @@ export function remove({ app, env = process.env, home } = {}) {
     return { action: "noop", reason: "no-state" };
   }
 
-  const { chunkPath, origOwnedByUs } = state;
+  const { chunkPath, origOwnedByUs, wrapperPath } = state;
   const backupPath = `${chunkPath}.orig`;
 
   if (!existsSync(chunkPath)) {
@@ -388,7 +484,8 @@ export function remove({ app, env = process.env, home } = {}) {
   if (!isPatched(content)) {
     // Our marker isn't there any more (already removed by hand, or Xirp
     // updated and replaced the chunk) — nothing for us to strip. Just drop
-    // our own state so we stop claiming to be applied.
+    // our own state (and wrapper) so we stop claiming to be applied.
+    removeWrapper(wrapperPath);
     clearState(home);
     return { action: "noop", reason: "not-patched" };
   }
@@ -398,6 +495,8 @@ export function remove({ app, env = process.env, home } = {}) {
 
   const harnessPath = path.join(path.dirname(chunkPath), HARNESS_FILENAME);
   if (existsSync(harnessPath)) unlinkSync(harnessPath);
+
+  removeWrapper(wrapperPath);
 
   // Only ever delete `.orig` if we're the one who created it, and only once
   // the chunk has returned to exactly that pristine state (i.e. no other
@@ -413,5 +512,5 @@ export function remove({ app, env = process.env, home } = {}) {
 
   clearState(home);
 
-  return { action: "removed", chunkPath };
+  return { action: "removed", chunkPath, wrapperPath };
 }

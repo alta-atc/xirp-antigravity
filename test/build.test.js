@@ -74,7 +74,7 @@ test("the built harness registers the expected harness and adapter shapes", asyn
   ]);
   assert.equal(def.flag, "--launch-antigravity");
   assert.equal(def.cmd, "launch-antigravity");
-  assert.equal(def.binary, "agy");
+  assert.equal(def.binary, "agy-xirp");
   assert.equal(def.visibility, "public");
   assert.equal(def.lifecycle.install.kind, "none");
   assert.equal(def.lifecycle.update.kind, "self-update");

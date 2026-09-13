@@ -14,6 +14,7 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
+  statSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +38,21 @@ import {
   PatchError,
 } from "../src/patcher/inject.js";
 import { readState, stateFilePath } from "../src/patcher/state.js";
+
+/**
+ * Report a wrapper (agy-xirp) path: whether it exists, and whether it's
+ * executable (mode & 0o111). Returns a one-line human string.
+ */
+function describeWrapper(wrapperPath) {
+  if (!wrapperPath) return "not recorded";
+  if (!existsSync(wrapperPath)) return `${wrapperPath} (missing)`;
+  try {
+    const executable = (statSync(wrapperPath).mode & 0o111) !== 0;
+    return `${wrapperPath} (${executable ? "executable" : "not executable"})`;
+  } catch (err) {
+    return `${wrapperPath} (could not stat: ${err.message})`;
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -100,6 +116,7 @@ function cmdStatus({ app }) {
   const state = readState();
   if (state) {
     console.log(`State:    ${stateFilePath()} (applied ${state.appliedAt}, patchVersion ${state.patchVersion})`);
+    console.log(`Wrapper:  ${describeWrapper(state.wrapperPath)}`);
   } else {
     console.log("State:    none");
   }
@@ -228,6 +245,14 @@ function cmdDoctor({ app }) {
     `~/.local/bin/agy: ${existsSync(agyHome) ? agyHome : "not found"}`,
   );
 
+  let agyXirpOnPath = null;
+  try {
+    agyXirpOnPath = execFileSync("which", ["agy-xirp"], { encoding: "utf8" }).trim();
+  } catch {
+    agyXirpOnPath = null;
+  }
+  console.log(`agy-xirp on PATH: ${agyXirpOnPath || "not found"}`);
+
   const state = readState();
   console.log(`State marker:    ${state ? stateFilePath() : "none"}`);
   if (state) {
@@ -236,6 +261,7 @@ function cmdDoctor({ app }) {
     console.log(`  chunkSha256Original: ${state.chunkSha256Original}`);
     console.log(`  chunkSha256Patched:  ${state.chunkSha256Patched}`);
     console.log(`  harnessSha256:       ${state.harnessSha256}`);
+    console.log(`  wrapperPath:         ${describeWrapper(state.wrapperPath)}`);
     console.log(`  patchVersion:        ${state.patchVersion}`);
     console.log(`  appliedAt:           ${state.appliedAt}`);
     console.log(`  origOwnedByUs:       ${state.origOwnedByUs}`);

@@ -9,6 +9,7 @@ registry identifiers squab used at each.
 | Xirp version | squab version | Antigravity CLI (agy) version | registry identifiers | status | date |
 |---|---|---|---|---|---|
 | 0.32.0 | 0.10.12-chirp.93ea528.5 | 1.2.0 | `V` / `z` | verified end-to-end against a scratch copy (harness listed, session pinned and tracked, parse OK, exit terminates) | 2026-09-13 |
+| 0.32.0 | 0.10.12-chirp.93ea528.5 | 1.2.2 | `V` / `z` | verified end-to-end with the `agy-xirp` launch wrapper (harness listed, session launches with the goal seeded via `-i` instead of failing on a positional argument, exit terminates) | 2026-09-13 |
 
 `registry identifiers` are the local variable names squab's minified bundle uses for
 `registerAdapter` / `registerAgent` in that build (detected automatically by
