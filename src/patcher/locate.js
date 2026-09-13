@@ -1,4 +1,4 @@
-// Locates the pieces of an installed Xirp.app that xirp-grok needs to patch:
+// Locates the pieces of an installed Xirp.app that xirp-antigravity needs to patch:
 // the app itself, its version, the bundled node runtime, the squab CLI, its
 // chunks directory, and the specific chunk that registers coding-agent
 // harnesses (identified by a stable string signature, since the chunk's

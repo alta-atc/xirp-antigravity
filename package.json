@@ -1,16 +1,16 @@
 {
-  "name": "xirp-grok",
+  "name": "xirp-antigravity",
   "version": "0.1.0",
-  "description": "Add xAI Grok Build as a coding agent in Spotify's Xirp desktop app (patch + re-apply tool)",
-  "keywords": ["xirp", "grok", "grok-build", "xai", "squab", "coding-agent", "electron-patch"],
+  "description": "Add Google Antigravity CLI (agy) as a coding agent in Spotify's Xirp desktop app (patch + re-apply tool)",
+  "keywords": ["xirp", "antigravity", "agy", "google", "squab", "coding-agent", "electron-patch"],
   "type": "module",
-  "bin": { "xirp-grok": "bin/xirp-grok.js" },
+  "bin": { "xirp-antigravity": "bin/xirp-antigravity.js" },
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test test/*.test.js",
     "build": "node scripts/build-harness.js"
   },
   "license": "MIT",
-  "repository": "github:alta-atc/xirp-grok",
+  "repository": "github:alta-atc/xirp-antigravity",
   "files": ["bin", "src", "dist", "launchd", "README.md", "LICENSE"]
 }

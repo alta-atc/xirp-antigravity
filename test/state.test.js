@@ -7,7 +7,7 @@ import path from "node:path";
 import { readState, writeState, clearState, stateFilePath } from "../src/patcher/state.js";
 
 test("state round-trips through write/read/clear", () => {
-  const home = mkdtempSync(path.join(os.tmpdir(), "xirp-grok-state-test-"));
+  const home = mkdtempSync(path.join(os.tmpdir(), "xirp-antigravity-state-test-"));
   try {
     assert.equal(readState(home), null);
 
@@ -19,10 +19,11 @@ test("state round-trips through write/read/clear", () => {
       harnessSha256: "c".repeat(64),
       patchVersion: "0.1.0",
       appliedAt: new Date().toISOString(),
+      origOwnedByUs: true,
     };
     writeState(state, home);
     assert.deepEqual(readState(home), state);
-    assert.ok(stateFilePath(home).endsWith(path.join(".xirp-grok", "state.json")));
+    assert.ok(stateFilePath(home).endsWith(path.join(".xirp-antigravity", "state.json")));
 
     clearState(home);
     assert.equal(readState(home), null);

@@ -1,14 +1,25 @@
-// Applies (and reverses) the Grok harness patch to an installed Xirp.app.
+// Applies (and reverses) the Antigravity harness patch to an installed Xirp.app.
 //
-// apply():   back up the registry chunk (once), append an import that wires
-//            registerGrok(rt, ot) into it, drop the built harness module next
-//            to it, then verify the squab CLI still loads and reports a
-//            "grok" harness.
-// remove():  restore the registry chunk byte-for-byte from its backup and
-//            delete the harness module + backup + state marker.
+// apply():   back up the registry chunk (once, and only if no `.orig` already
+//            exists — xirp-grok may have gotten there first), append an
+//            import that wires registerAntigravity(rt, ot) into it, drop the
+//            built harness module next to it, then verify the squab CLI
+//            still loads and reports an "antigravity" harness.
+// remove():  strip only *our* import line from the registry chunk (never a
+//            full restore-from-backup, which would also rip out a coexisting
+//            xirp-grok patch), delete only our harness module, and drop the
+//            `.orig` backup only if we created it and nothing else is
+//            patching the chunk any more.
 //
 // Both are idempotent: calling apply() twice, or remove() with nothing
 // applied, is a safe no-op with a clear message rather than an error.
+//
+// Coexistence with xirp-grok: both tools patch the very same squab registry
+// chunk by appending one import line each. Whichever tool runs `apply` first
+// creates the `.orig` backup (the pristine, unpatched chunk) and "owns" it;
+// the second tool must never overwrite that backup and must never restore
+// the whole chunk from it, since that would silently undo the first tool's
+// patch too. `origOwnedByUs` in state.json records which case happened here.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -30,15 +41,25 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
 // Marker that identifies our injected line regardless of which local
 // identifiers the registry functions happen to have in a given Xirp build.
-export const IMPORT_MARKER = 'from "./grok-harness.js"';
-const IMPORT_LINE_RE = /\nimport \{ registerGrok \} from "\.\/grok-harness\.js"; registerGrok\([A-Za-z_$][\w$]*, [A-Za-z_$][\w$]*\);\n/g;
+export const IMPORT_MARKER = 'from "./antigravity-harness.js"';
+const IMPORT_LINE_RE = /\nimport \{ registerAntigravity \} from "\.\/antigravity-harness\.js"; registerAntigravity\([A-Za-z_$][\w$]*, [A-Za-z_$][\w$]*\);\n/g;
+
+// Marker for xirp-grok's own injected line, so we can detect (for `doctor`/
+// `status`, and for deciding whether it's still safe to drop `.orig`) that a
+// second tool has also patched this chunk. We never write this line
+// ourselves and never strip it.
+export const GROK_IMPORT_MARKER = 'from "./grok-harness.js"';
 
 export function isPatched(content) {
   return content.includes(IMPORT_MARKER);
 }
 
+export function isGrokPatched(content) {
+  return content.includes(GROK_IMPORT_MARKER);
+}
+
 export function buildImportLine({ registerAdapter, registerAgent }) {
-  return `\nimport { registerGrok } from "./grok-harness.js"; registerGrok(${registerAdapter}, ${registerAgent});\n`;
+  return `\nimport { registerAntigravity } from "./antigravity-harness.js"; registerAntigravity(${registerAdapter}, ${registerAgent});\n`;
 }
 
 /**
@@ -76,7 +97,7 @@ export function detectRegistryIdentifiers(content) {
   return { registerAdapter, registerAgent, cursorVar };
 }
 
-export const HARNESS_FILENAME = "grok-harness.js";
+export const HARNESS_FILENAME = "antigravity-harness.js";
 
 export class PatchError extends Error {
   constructor(message, { code = 1 } = {}) {
@@ -91,9 +112,10 @@ function sha256(content) {
 }
 
 /**
- * Resolve the harness module to install: the built dist/grok-harness.js if
- * WS2's build has run, otherwise the raw src/harness/grok-harness.js source
- * (or, in tests, an explicit override path). Fails loudly if neither exists.
+ * Resolve the harness module to install: the built dist/antigravity-harness.js
+ * if the harness build has run, otherwise the raw
+ * src/harness/antigravity-harness.js source (or, in tests, an explicit
+ * override path). Fails loudly if neither exists.
  */
 export function resolveHarnessSource({ repoRoot = REPO_ROOT, override } = {}) {
   if (override) {
@@ -102,10 +124,10 @@ export function resolveHarnessSource({ repoRoot = REPO_ROOT, override } = {}) {
     }
     return override;
   }
-  const distPath = path.join(repoRoot, "dist", "grok-harness.js");
+  const distPath = path.join(repoRoot, "dist", "antigravity-harness.js");
   if (existsSync(distPath)) return distPath;
 
-  const srcPath = path.join(repoRoot, "src", "harness", "grok-harness.js");
+  const srcPath = path.join(repoRoot, "src", "harness", "antigravity-harness.js");
   if (existsSync(srcPath)) return srcPath;
 
   throw new PatchError(
@@ -116,7 +138,8 @@ export function resolveHarnessSource({ repoRoot = REPO_ROOT, override } = {}) {
 
 /**
  * Read the version declared in package.json (the "patch version" recorded in
- * state, so future runs can tell which version of xirp-grok applied a patch).
+ * state, so future runs can tell which version of xirp-antigravity applied a
+ * patch).
  */
 function readPatchVersion(repoRoot = REPO_ROOT) {
   const pkg = JSON.parse(
@@ -126,7 +149,8 @@ function readPatchVersion(repoRoot = REPO_ROOT) {
 }
 
 /**
- * Verify the patched squab CLI still runs and now reports a "grok" harness.
+ * Verify the patched squab CLI still runs and now reports an "antigravity"
+ * harness.
  */
 function verify({ nodePath, cliPath }) {
   let availableRaw;
@@ -161,10 +185,10 @@ function verify({ nodePath, cliPath }) {
         `nor a "harnesses" array:\n${availableRaw}`,
     );
   }
-  const hasGrok = harnessList.some((h) => h && h.agentName === "grok");
-  if (!hasGrok) {
+  const hasAntigravity = harnessList.some((h) => h && h.agentName === "antigravity");
+  if (!hasAntigravity) {
     throw new PatchError(
-      `Verification failed: no harness with agentName "grok" in --available-harnesses output:\n${availableRaw}`,
+      `Verification failed: no harness with agentName "antigravity" in --available-harnesses output:\n${availableRaw}`,
     );
   }
 
@@ -205,9 +229,14 @@ function resolveRegistryIdentifiers(chunk) {
 }
 
 /**
- * Apply the Grok harness patch. Idempotent: if the chunk already contains
- * the import line, this is a no-op (unless `force`, which re-copies the
- * harness module and refreshes state without re-appending the import).
+ * Apply the Antigravity harness patch. Idempotent: if the chunk already
+ * contains our import line, this is a no-op (unless `force`, which re-copies
+ * the harness module and refreshes state without re-appending the import).
+ *
+ * Safe to run after xirp-grok (or before it): the chunk's existing content —
+ * pristine, or already carrying grok's own import line — is preserved as-is
+ * and our line is appended after it. The `.orig` backup is created only if
+ * one doesn't already exist (so we never clobber grok's pristine backup).
  */
 export function apply({
   app,
@@ -225,6 +254,7 @@ export function apply({
   const alreadyPatched = isPatched(chunk.content);
 
   if (alreadyPatched && !force) {
+    const priorState = readState(home);
     writeState(
       {
         xirpVersion: version,
@@ -237,7 +267,8 @@ export function apply({
           ? sha256(readFileSync(harnessDest, "utf8"))
           : null,
         patchVersion: readPatchVersion(repoRoot),
-        appliedAt: readState(home)?.appliedAt ?? new Date().toISOString(),
+        appliedAt: priorState?.appliedAt ?? new Date().toISOString(),
+        origOwnedByUs: priorState?.origOwnedByUs ?? false,
       },
       home,
     );
@@ -260,8 +291,9 @@ export function apply({
 
   let baseContent = chunk.content;
   if (alreadyPatched && force) {
-    // Refresh path: strip the existing import line so we don't duplicate it,
-    // then re-append below with (possibly) an updated harness.
+    // Refresh path: strip only our existing import line so we don't
+    // duplicate it, then re-append below with (possibly) an updated
+    // harness. Any foreign (e.g. grok) import line is left untouched.
     baseContent = chunk.content.replace(IMPORT_LINE_RE, "");
   }
 
@@ -277,6 +309,13 @@ export function apply({
       copyFileSync(chunk.path, backupPath);
     }
   }
+  // Whoever creates the `.orig` backup "owns" it: only the owner may ever
+  // delete it (on `remove`). If a backup already existed here, some other
+  // tool (xirp-grok) got there first and owns it — never overwrite or later
+  // delete it ourselves. Fall back to whatever a prior run of ours recorded,
+  // since a `force` refresh doesn't recreate an existing backup.
+  const priorState = readState(home);
+  const origOwnedByUs = backupCreatedThisRun || Boolean(priorState?.origOwnedByUs);
 
   const newContent = baseContent + importLine;
 
@@ -285,11 +324,13 @@ export function apply({
     writeFileSync(chunk.path, newContent, "utf8");
     verify({ nodePath, cliPath });
   } catch (err) {
-    // Never leave Xirp in a broken half-patched state: restore the chunk,
-    // drop the harness copy, and remove the backup only if we created it
-    // in this run (a pre-existing backup is still needed for a future
-    // `remove`).
-    writeFileSync(chunk.path, readFileSync(backupPath));
+    // Never leave Xirp in a broken half-patched state: restore the chunk to
+    // exactly what it held before this run's edit (which may already carry a
+    // foreign import line — never the full `.orig` backup, which could be
+    // older than that), drop the harness copy, and remove the backup only if
+    // we created it in this run (a pre-existing backup is still needed for a
+    // future `remove`, by us or by whichever tool owns it).
+    writeFileSync(chunk.path, baseContent, "utf8");
     if (existsSync(harnessDest)) unlinkSync(harnessDest);
     if (backupCreatedThisRun) unlinkSync(backupPath);
     throw new PatchError(`Rolled back: ${err.message}`, {
@@ -306,6 +347,7 @@ export function apply({
     harnessSha256: sha256(readFileSync(harnessDest, "utf8")),
     patchVersion: readPatchVersion(repoRoot),
     appliedAt: new Date().toISOString(),
+    origOwnedByUs,
   };
   writeState(state, home);
 
@@ -319,8 +361,11 @@ export function apply({
 }
 
 /**
- * Remove the patch: restore the registry chunk from its backup byte-for-byte,
- * delete the harness module and backup, and clear the state marker.
+ * Remove the patch: strip only our own import line from the registry chunk
+ * (never a full restore-from-backup — that would also undo a coexisting
+ * xirp-grok patch), delete our harness module, and drop the `.orig` backup
+ * only if we created it *and* the chunk is now byte-identical to it (i.e.
+ * nothing else is still patching it). Clears our state marker either way.
  * No-op (not an error) if there's nothing to remove.
  */
 export function remove({ app, env = process.env, home } = {}) {
@@ -329,37 +374,43 @@ export function remove({ app, env = process.env, home } = {}) {
     return { action: "noop", reason: "no-state" };
   }
 
-  const { chunkPath } = state;
+  const { chunkPath, origOwnedByUs } = state;
   const backupPath = `${chunkPath}.orig`;
 
   if (!existsSync(chunkPath)) {
     throw new PatchError(
       `Recorded chunk not found at ${chunkPath} (Xirp may have been updated or moved). ` +
-        `Run \`xirp-grok doctor\` to inspect the current install.`,
-    );
-  }
-  if (!existsSync(backupPath)) {
-    throw new PatchError(
-      `Backup not found at ${backupPath}; cannot restore. Nothing was changed.`,
+        `Run \`xirp-antigravity doctor\` to inspect the current install.`,
     );
   }
 
-  const backupBuffer = readFileSync(backupPath);
-  const backupHash = sha256(backupBuffer);
-
-  copyFileSync(backupPath, chunkPath);
-
-  const restoredHash = sha256(readFileSync(chunkPath));
-  if (restoredHash !== backupHash) {
-    throw new PatchError(
-      `Restore verification failed: ${chunkPath} does not match its backup after writing. ` +
-        `Refusing to delete the backup at ${backupPath}.`,
-    );
+  const content = readFileSync(chunkPath, "utf8");
+  if (!isPatched(content)) {
+    // Our marker isn't there any more (already removed by hand, or Xirp
+    // updated and replaced the chunk) — nothing for us to strip. Just drop
+    // our own state so we stop claiming to be applied.
+    clearState(home);
+    return { action: "noop", reason: "not-patched" };
   }
+
+  const stripped = content.replace(IMPORT_LINE_RE, "");
+  writeFileSync(chunkPath, stripped, "utf8");
 
   const harnessPath = path.join(path.dirname(chunkPath), HARNESS_FILENAME);
   if (existsSync(harnessPath)) unlinkSync(harnessPath);
-  unlinkSync(backupPath);
+
+  // Only ever delete `.orig` if we're the one who created it, and only once
+  // the chunk has returned to exactly that pristine state (i.e. no other
+  // tool, like xirp-grok, is still patching it) — otherwise leave it in
+  // place for whoever still needs it.
+  if (origOwnedByUs && existsSync(backupPath)) {
+    const backupBuffer = readFileSync(backupPath);
+    const strippedBuffer = readFileSync(chunkPath);
+    if (Buffer.compare(backupBuffer, strippedBuffer) === 0) {
+      unlinkSync(backupPath);
+    }
+  }
+
   clearState(home);
 
   return { action: "removed", chunkPath };

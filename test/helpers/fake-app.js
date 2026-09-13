@@ -9,9 +9,14 @@ import path from "node:path";
 // Minified form, exactly as shipped in Xirp's squab chunk (no space after the colon).
 export const SIGNATURE = 'flag:"--launch-cursor"';
 
-function fakeNodeScript({ includeGrok = true } = {}) {
+// The import line xirp-grok appends to the same registry chunk, used to
+// simulate that tool having patched first (coexistence tests).
+export const GROK_IMPORT_LINE =
+  '\nimport { registerGrok } from "./grok-harness.js"; registerGrok(V, z);\n';
+
+function fakeNodeScript({ includeAntigravity = true } = {}) {
   const harnesses = [{ agentName: "cursor" }];
-  if (includeGrok) harnesses.push({ agentName: "grok" });
+  if (includeAntigravity) harnesses.push({ agentName: "antigravity" });
   // Mirrors the real squab CLI's --available-harnesses shape:
   // {"schema":"squab.available-harnesses/v3","count":N,"harnesses":[...]},
   // not a bare array.
@@ -54,17 +59,22 @@ function infoPlist(version) {
  * @param {boolean} [opts.withSignature] - include the --launch-cursor signature in the chunk
  * @param {boolean} [opts.withRtOt] - include rt(...)/ot(...) calls in the chunk
  * @param {string} [opts.chunkName] - filename for the registry chunk
- * @param {boolean} [opts.includeGrok] - whether the fake node's --available-harnesses reports grok
- * @returns {{tmpDir, appPath, nodePath, cliPath, chunksDir, chunkPath}}
+ * @param {boolean} [opts.includeAntigravity] - whether the fake node's --available-harnesses reports antigravity
+ * @param {boolean} [opts.withForeignGrokPatch] - simulate xirp-grok having already
+ *   patched this chunk: the chunk on disk carries grok's import line, and a
+ *   `.orig` backup (the pristine, foreign-free content) already exists as if
+ *   xirp-grok created it.
+ * @returns {{tmpDir, appPath, nodePath, cliPath, chunksDir, chunkPath, chunkContent, pristineContent}}
  */
 export function createFakeApp({
   version = "0.32.0",
   withSignature = true,
   withRtOt = true,
   chunkName = "index-abc.js",
-  includeGrok = true,
+  includeAntigravity = true,
+  withForeignGrokPatch = false,
 } = {}) {
-  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "xirp-grok-test-"));
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "xirp-antigravity-test-"));
   const appPath = path.join(tmpDir, "Xirp.app");
 
   mkdirSync(path.join(appPath, "Contents"), { recursive: true });
@@ -82,7 +92,7 @@ export function createFakeApp({
   );
   mkdirSync(nodeRuntimeDir, { recursive: true });
   const nodePath = path.join(nodeRuntimeDir, "node");
-  writeFileSync(nodePath, fakeNodeScript({ includeGrok }), "utf8");
+  writeFileSync(nodePath, fakeNodeScript({ includeAntigravity }), "utf8");
   chmodSync(nodePath, 0o755);
 
   const squabDir = path.join(
@@ -103,12 +113,30 @@ export function createFakeApp({
 
   const rtOt = withRtOt ? "function _c(){V(Qe),V(Zn),z(yc),z(vc)}" : "// no registry calls here";
   const signature = withSignature ? SIGNATURE : "flag: \"--not-it\"";
-  const chunkContent = `// synthetic squab chunk\nconst yc={flag:"--launch-claude",agentName:"claude"},vc={${signature},agentName:"cursor"};\n${rtOt}\n`;
+  const pristineContent = `// synthetic squab chunk\nconst yc={flag:"--launch-claude",agentName:"claude"},vc={${signature},agentName:"cursor"};\n${rtOt}\n`;
+
+  const chunkContent = withForeignGrokPatch
+    ? pristineContent + GROK_IMPORT_LINE
+    : pristineContent;
 
   const chunkPath = path.join(chunksDir, chunkName);
   writeFileSync(chunkPath, chunkContent, "utf8");
 
-  return { tmpDir, appPath, nodePath, cliPath, chunksDir, chunkPath, chunkContent };
+  if (withForeignGrokPatch) {
+    // Simulate xirp-grok having created the pristine backup before us.
+    writeFileSync(`${chunkPath}.orig`, pristineContent, "utf8");
+  }
+
+  return {
+    tmpDir,
+    appPath,
+    nodePath,
+    cliPath,
+    chunksDir,
+    chunkPath,
+    chunkContent,
+    pristineContent,
+  };
 }
 
 export function fakeHome(tmpDir) {

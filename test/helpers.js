@@ -9,29 +9,29 @@ const FIXTURES = path.join(here, "fixtures");
 const REPO_ROOT = path.resolve(here, "..");
 
 /**
- * Point GROK_HOME at a fresh temp dir for the duration of one test and restore
- * it afterwards. Never touches the developer's real ~/.grok.
+ * Point ANTIGRAVITY_HOME at a fresh temp dir for the duration of one test and
+ * restore it afterwards. Never touches the developer's real ~/.gemini.
  */
-async function useTempGrokHome(t) {
-  const previous = process.env.GROK_HOME;
-  const home = await fsp.mkdtemp(path.join(os.tmpdir(), "xirp-grok-test-"));
-  process.env.GROK_HOME = home;
+async function useTempAntigravityHome(t) {
+  const previous = process.env.ANTIGRAVITY_HOME;
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), "xirp-antigravity-test-"));
+  process.env.ANTIGRAVITY_HOME = home;
   t.after(async () => {
-    if (previous === undefined) delete process.env.GROK_HOME;
-    else process.env.GROK_HOME = previous;
+    if (previous === undefined) delete process.env.ANTIGRAVITY_HOME;
+    else process.env.ANTIGRAVITY_HOME = previous;
     await fsp.rm(home, { recursive: true, force: true });
   });
   return home;
 }
 
-async function tempDir(t, prefix = "xirp-grok-tmp-") {
+async function tempDir(t, prefix = "xirp-antigravity-tmp-") {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
   t.after(() => fsp.rm(dir, { recursive: true, force: true }));
   return dir;
 }
 
 /**
- * Copy a hand-authored fixture session into a GROK_HOME bucket.
+ * Copy a hand-authored fixture session into an ANTIGRAVITY_HOME bucket.
  * bucketDirName defaults to encodeURIComponent(cwd); pass an explicit name to
  * exercise the ".cwd" marker lookup.
  */
@@ -67,4 +67,4 @@ function readFixture(fixtureName, file) {
   return fsp.readFile(path.join(FIXTURES, fixtureName, file), "utf-8");
 }
 
-export { FIXTURES, REPO_ROOT, useTempGrokHome, tempDir, installFixture, readFixture };
+export { FIXTURES, REPO_ROOT, useTempAntigravityHome, tempDir, installFixture, readFixture };
