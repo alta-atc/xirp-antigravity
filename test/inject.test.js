@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync, unlinkSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, existsSync, rmSync, mkdirSync, chmodSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +13,7 @@ import {
   buildImportLine,
   detectRegistryIdentifiers,
   HARNESS_FILENAME,
+  WRAPPER_FILENAME,
   PatchError,
 } from "../src/patcher/inject.js";
 import { LocateError } from "../src/patcher/locate.js";
@@ -20,6 +21,21 @@ import { readState } from "../src/patcher/state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STUB_HARNESS = path.join(__dirname, "fixtures", "antigravity-harness.stub.js");
+
+/** A temp bin/ directory containing an executable file named `agy`. */
+function fakeAgyBinDir(tmpDir) {
+  const binDir = path.join(tmpDir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const agyPath = path.join(binDir, "agy");
+  writeFileSync(agyPath, "#!/bin/sh\necho fake agy\n", "utf8");
+  chmodSync(agyPath, 0o755);
+  return binDir;
+}
+
+/** A PATH that resolves `agy` to the fake bin dir, and `which` itself. */
+function pathWithFakeAgy(binDir) {
+  return `${binDir}:/usr/bin:/bin`;
+}
 
 test("apply appends the import line, backs up the chunk, copies the harness, and writes state", () => {
   const fake = createFakeApp();
@@ -316,6 +332,102 @@ test("remove when we own the backup and nothing else is patched deletes the back
     assert.equal(readFileSync(fake.chunkPath, "utf8"), fake.chunkContent);
     assert.ok(!existsSync(backupPath), "we own the backup and nothing else is patched, so it's deleted");
     assert.equal(readState(home), null);
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
+// --- agy-xirp launch wrapper -------------------------------------------
+
+test("apply installs the agy-xirp wrapper next to the resolved `agy` on PATH, and records it in state", () => {
+  const fake = createFakeApp();
+  const home = fakeHome(fake.tmpDir);
+  const binDir = fakeAgyBinDir(fake.tmpDir);
+  try {
+    const result = apply({
+      app: fake.appPath,
+      env: { PATH: pathWithFakeAgy(binDir) },
+      home,
+      harnessOverride: STUB_HARNESS,
+    });
+
+    const wrapperPath = path.join(binDir, WRAPPER_FILENAME);
+    assert.equal(result.state.wrapperPath, wrapperPath);
+    assert.ok(existsSync(wrapperPath), "wrapper should be installed next to the resolved agy");
+    const mode = statSync(wrapperPath).mode;
+    assert.ok(mode & 0o111, "wrapper should be executable");
+
+    const state = readState(home);
+    assert.equal(state.wrapperPath, wrapperPath);
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("apply falls back to <home>/.local/bin for the wrapper when agy is not on PATH", () => {
+  const fake = createFakeApp();
+  const home = fakeHome(fake.tmpDir);
+  try {
+    const result = apply({
+      app: fake.appPath,
+      env: { PATH: "/usr/bin:/bin" },
+      home,
+      harnessOverride: STUB_HARNESS,
+    });
+
+    const expected = path.join(home, ".local", "bin", WRAPPER_FILENAME);
+    assert.equal(result.state.wrapperPath, expected);
+    assert.ok(existsSync(expected));
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("remove deletes the agy-xirp wrapper it installed", () => {
+  const fake = createFakeApp();
+  const home = fakeHome(fake.tmpDir);
+  const binDir = fakeAgyBinDir(fake.tmpDir);
+  try {
+    const applied = apply({
+      app: fake.appPath,
+      env: { PATH: pathWithFakeAgy(binDir) },
+      home,
+      harnessOverride: STUB_HARNESS,
+    });
+    const wrapperPath = applied.state.wrapperPath;
+    assert.ok(existsSync(wrapperPath));
+
+    const result = remove({ app: fake.appPath, env: { PATH: pathWithFakeAgy(binDir) }, home });
+    assert.equal(result.action, "removed");
+    assert.equal(result.wrapperPath, wrapperPath);
+    assert.ok(!existsSync(wrapperPath), "wrapper should be gone after remove");
+  } finally {
+    rmSync(fake.tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("a second apply (noop path) re-installs a wrapper that was deleted by hand", () => {
+  const fake = createFakeApp();
+  const home = fakeHome(fake.tmpDir);
+  const binDir = fakeAgyBinDir(fake.tmpDir);
+  try {
+    const first = apply({
+      app: fake.appPath,
+      env: { PATH: pathWithFakeAgy(binDir) },
+      home,
+      harnessOverride: STUB_HARNESS,
+    });
+    unlinkSync(first.state.wrapperPath);
+    assert.ok(!existsSync(first.state.wrapperPath));
+
+    const second = apply({
+      app: fake.appPath,
+      env: { PATH: pathWithFakeAgy(binDir) },
+      home,
+      harnessOverride: STUB_HARNESS,
+    });
+    assert.equal(second.action, "noop");
+    assert.ok(existsSync(second.wrapperPath), "noop apply should re-install a missing wrapper");
   } finally {
     rmSync(fake.tmpDir, { recursive: true, force: true });
   }

@@ -38,7 +38,7 @@ export function readState(home = os.homedir()) {
 // When run under sudo (needed on macOS because of App Management protection),
 // keep the state marker owned by the invoking user so later unprivileged
 // `status`/`doctor` runs and future applies can still read and replace it.
-function chownToSudoUser(p) {
+export function chownToSudoUser(p) {
   const uid = Number(process.env.SUDO_UID);
   const gid = Number(process.env.SUDO_GID);
   if (process.getuid?.() !== 0 || !Number.isInteger(uid) || uid <= 0) return;

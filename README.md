@@ -23,10 +23,34 @@ coding-agent harness (Claude, Cursor, etc.) that shows up in Xirp's agent picker
 3. Copies one self-contained file, `chunks/antigravity-harness.js`, next to it. This is the whole
    integration: a harness definition (flag, binary, install hint) plus a session adapter that
    reads/writes Antigravity's own conversation files so Xirp can track and resume sessions.
-4. Writes a state marker to `~/.xirp-antigravity/state.json` (hashes, versions, timestamp) so
-   future runs can tell whether Xirp has been updated and needs re-patching.
+4. Installs the `agy-xirp` launch wrapper next to whatever `agy` resolves to on `PATH` (see
+   [Launch wrapper](#launch-wrapper) below) and points the harness at it instead of `agy` directly.
+5. Writes a state marker to `~/.xirp-antigravity/state.json` (hashes, versions, wrapper path,
+   timestamp) so future runs can tell whether Xirp has been updated and needs re-patching.
 
 Nothing else is modified. `app.asar` is never touched.
+
+## Launch wrapper
+
+Xirp builds every coding agent's command line itself, and for **every** agent it appends the
+session's initial prompt as a bare trailing positional argument — something like
+`agy --launch-antigravity --session-id <id> 'do the thing'`. That argv-building code lives inside
+squab's integrity-checked `app.asar` and can't be patched from outside it. `agy` (a Go binary
+built on the standard `flag` package) rejects positional arguments outright — `Error: unexpected
+argument "do the thing". Prompts are read only from -p/--print, -i/--prompt-interactive, or
+stdin` — and exits non-zero, which from Xirp looks like the terminal flashing open and closing.
+
+`apply` installs `src/wrapper/agy-xirp`, a small bash script, as `agy-xirp` in the same directory
+`agy` resolves to on `PATH` (falling back to `~/.local/bin` — where `agy install` puts the real
+binary — if `agy` isn't on `PATH` yet), and the harness definition's `binary` points at
+`agy-xirp` instead of `agy`. The wrapper rewrites a trailing positional argument into
+`-i "<text>"` (folding it into an already-present `-i`/`--prompt-interactive` value instead, if
+one exists) and then `exec`s the real `agy` with the rewritten argv. Every other invocation shape
+— no args, a subcommand like `agy mcp ...`, an already-flag-only argv — passes straight through
+untouched.
+
+`remove` deletes the wrapper it installed (recorded as `wrapperPath` in
+`~/.xirp-antigravity/state.json`); it never touches the real `agy` binary.
 
 ## Requirements
 
@@ -182,6 +206,8 @@ Layout:
 - `src/harness/` — the Antigravity harness definition and squab session adapter that get built
   into `chunks/antigravity-harness.js` (`adapter.js`, `paths.js`, `transcript.js`,
   `antigravity-harness.js`)
+- `src/wrapper/agy-xirp` — the launch wrapper `apply` installs next to `agy` on `PATH` (see
+  [Launch wrapper](#launch-wrapper))
 - `scripts/build-harness.js` — bundles `src/harness/` into the single-file
   `dist/antigravity-harness.js` that `apply` copies into Xirp
 

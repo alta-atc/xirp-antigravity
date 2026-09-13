@@ -56,9 +56,10 @@ test("the harness definition describes the agy CLI", () => {
   assert.equal(antigravityHarnessDef.flag, "--launch-antigravity");
   assert.equal(antigravityHarnessDef.cmd, "launch-antigravity");
   assert.equal(antigravityHarnessDef.agentName, "antigravity");
-  assert.equal(antigravityHarnessDef.binary, "agy");
+  assert.equal(antigravityHarnessDef.binary, "agy-xirp");
   assert.equal(antigravityHarnessDef.visibility, "public");
   assert.match(antigravityHarnessDef.installHint, /antigravity\.google/);
+  assert.match(antigravityHarnessDef.installHint, /agy-xirp/);
   assert.match(antigravityHarnessDef.description, /`agy`/);
   // Google publishes no install script, so there is nothing honest to run.
   assert.deepEqual(antigravityHarnessDef.lifecycle.install, { kind: "none" });
